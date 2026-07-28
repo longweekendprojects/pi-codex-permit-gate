@@ -97,9 +97,6 @@ async function startDaemon(overrides = {}) {
       ...process.env,
       HOME: home,
       CODEX_PERMIT_GATE_PORT: String(port),
-      CODEX_PERMIT_GATE_MIN: "1",
-      CODEX_PERMIT_GATE_MAX: "1",
-      CODEX_PERMIT_GATE_START: "1",
       ...overrides,
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -126,8 +123,48 @@ async function waitForQueued(port, count) {
   }, `queue did not reach ${count}`);
 }
 
-test("daemon enforces one permit and schedules orchestration roots round-robin", async (t) => {
+// Most scheduling assertions need a single deterministic slot. Throughput
+// behavior is asserted separately, against the shipped defaults.
+const SERIALIZED = {
+  CODEX_PERMIT_GATE_MIN: "1",
+  CODEX_PERMIT_GATE_MAX: "1",
+  CODEX_PERMIT_GATE_START: "1",
+};
+
+test("shipped defaults keep several requests in flight and never serialize", async (t) => {
   const daemon = await startDaemon();
+  t.after(() => daemon.stop());
+
+  const health = await getHealth(daemon.port);
+  assert.equal(health.min, 2, "default floor must keep more than one request in flight");
+  assert.equal(health.current, 3);
+  assert.equal(health.max, 6);
+
+  // Three concurrent holders must all be granted without any queueing.
+  const holders = await Promise.all([
+    acquire(daemon.port, "root-a"),
+    acquire(daemon.port, "root-b"),
+    acquire(daemon.port, "root-c"),
+  ]);
+  for (const holder of holders) assert.equal(holder.status, 200);
+  const busy = await getHealth(daemon.port);
+  assert.equal(busy.active, 3);
+  assert.equal(busy.queued, 0);
+  assert.equal(busy.peakActive, 3);
+
+  // Sustained provider failures step concurrency down, but never to one.
+  for (let i = 0; i < 6; i++) {
+    await request(daemon.port, "POST", "/throttle", { reason: "overloaded", cooldownMs: 1000 });
+  }
+  const throttled = await getHealth(daemon.port);
+  assert.equal(throttled.current, 2, "backoff must stop at the throughput floor");
+  assert(throttled.cooldownMsRemaining <= 15000, "a single transient must not freeze lanes for minutes");
+
+  for (const holder of holders) await release(daemon.port, holder.body.permitId);
+});
+
+test("daemon enforces one permit and schedules orchestration roots round-robin", async (t) => {
+  const daemon = await startDaemon(SERIALIZED);
   t.after(() => daemon.stop());
 
   const holder = await acquire(daemon.port, "holder", "holder-session");
@@ -179,7 +216,7 @@ test("daemon enforces one permit and schedules orchestration roots round-robin",
 });
 
 test("throttle paces the next grant and unknown releases are idempotent", async (t) => {
-  const daemon = await startDaemon();
+  const daemon = await startDaemon(SERIALIZED);
   t.after(() => daemon.stop());
 
   const first = await acquire(daemon.port, "first");
@@ -210,7 +247,7 @@ test("throttle paces the next grant and unknown releases are idempotent", async 
 });
 
 test("renewed leases never expire by request age, while abandoned leases are reclaimed", async (t) => {
-  const daemon = await startDaemon({ CODEX_PERMIT_GATE_PERMIT_TTL_MS: "100" });
+  const daemon = await startDaemon({ ...SERIALIZED, CODEX_PERMIT_GATE_PERMIT_TTL_MS: "100" });
   t.after(() => daemon.stop());
 
   const first = await acquire(daemon.port, "live-client");
@@ -239,7 +276,7 @@ test("renewed leases never expire by request age, while abandoned leases are rec
 });
 
 test("SIGTERM drains queued clients with an explicit retry response", async () => {
-  const daemon = await startDaemon();
+  const daemon = await startDaemon(SERIALIZED);
   const first = await acquire(daemon.port, "active");
   assert(first.body.permitId);
   const waiting = acquire(daemon.port, "queued");
@@ -254,7 +291,7 @@ test("SIGTERM drains queued clients with an explicit retry response", async () =
 });
 
 test("a second daemon on the same port exits cleanly without replacing the first", async (t) => {
-  const daemon = await startDaemon();
+  const daemon = await startDaemon(SERIALIZED);
   t.after(() => daemon.stop());
 
   const second = spawn(process.execPath, [daemonPath], {

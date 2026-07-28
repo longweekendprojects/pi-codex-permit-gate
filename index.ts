@@ -210,12 +210,12 @@ function classifyProviderFailure(message: any): ProviderFailure | undefined {
   return undefined;
 }
 function cooldownForFailure(failure: ProviderFailure): number {
-  // Short pacing after a provider throttle. The daemon caps these anyway; the
-  // permit (concurrency limit) is what prevents most failures, and pi's own
-  // retry handles the occasional one. These are deliberately seconds, not
-  // minutes, so one throttle never freezes an idle gate.
-  if (failure === "overloaded") return Number(process.env.CODEX_PERMIT_GATE_OVERLOADED_COOLDOWN_MS || 60 * 1000);
-  return Number(process.env.CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS || 20 * 1000);
+  // Short pacing after a provider throttle. A cooldown stops every session, so
+  // it is charged to the whole machine: one transient must not cost minutes of
+  // queue time across every lane. Concurrency backoff, not a long freeze, is the
+  // real control, and Pi's own retry absorbs the occasional failure.
+  if (failure === "overloaded") return Number(process.env.CODEX_PERMIT_GATE_OVERLOADED_COOLDOWN_MS || 8 * 1000);
+  return Number(process.env.CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS || 10 * 1000);
 }
 
 export default async function (pi: ExtensionAPI) {

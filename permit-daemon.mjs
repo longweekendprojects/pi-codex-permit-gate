@@ -14,15 +14,22 @@ import os from "node:os";
 import crypto from "node:crypto";
 
 const PORT = parseInt(process.env.CODEX_PERMIT_GATE_PORT || "8795", 10);
-const MIN = Math.max(1, parseInt(process.env.CODEX_PERMIT_GATE_MIN || "1", 10));
-const MAX = Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_MAX || "1", 10));
-let current = Math.min(MAX, Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_START || "1", 10)));
-const COOLDOWN_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_COOLDOWN_MS || "20000", 10));
+// Concurrency is adaptive, not fixed. MIN is a throughput floor: a queue that
+// never runs more than one request in flight cannot exceed one request per
+// service time, so a burst of provider errors must never collapse the gate into
+// a single serialized stream. Throttles walk concurrency down toward MIN and
+// clean windows walk it back up toward MAX.
+const MIN = Math.max(1, parseInt(process.env.CODEX_PERMIT_GATE_MIN || "2", 10));
+const MAX = Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_MAX || "6", 10));
+let current = Math.min(MAX, Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_START || "3", 10)));
+// A cooldown pauses every lane, so it is priced in seconds. Provider faults are
+// retried; queue time is not recoverable.
+const COOLDOWN_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_COOLDOWN_MS || "5000", 10));
 // Hard ceiling on any single cooldown, so one throttle (or a stale client that
 // still asks for a multi-minute cooldown) can never freeze an idle lane for
 // minutes. A throttle paces the next grant; it does not take the lane offline.
-const MAX_COOLDOWN_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_MAX_COOLDOWN_MS || "60000", 10));
-const INCREASE_AFTER_MS = Math.max(10000, parseInt(process.env.CODEX_PERMIT_GATE_INCREASE_AFTER_MS || "120000", 10));
+const MAX_COOLDOWN_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_MAX_COOLDOWN_MS || "15000", 10));
+const INCREASE_AFTER_MS = Math.max(10000, parseInt(process.env.CODEX_PERMIT_GATE_INCREASE_AFTER_MS || "60000", 10));
 // A granted permit whose client stops renewing is auto-reclaimed after this
 // long. Live clients renew while their provider request runs, so request age
 // alone never creates a second concurrent grant.

@@ -33,11 +33,13 @@ The extension starts its local daemon on demand. Non-Codex providers bypass the 
 
 It does **not** proxy provider traffic, read credentials, or modify request payloads.
 
-## Why the default is one
+## How concurrency is chosen
 
-The default and supported production setting is one concurrent Codex request. In the workload that motivated this extension, each of three attempts to raise concurrency to two was followed by a Codex overload response. Returning to one removed that repeated burst pattern.
+Concurrency adapts between a floor and a ceiling rather than being fixed. The gate starts at three requests in flight, steps down after a provider overload or rate-limit response, and steps back up after a clean window.
 
-This is pacing, not an availability guarantee. Isolated provider failures still occurred at concurrency `1/1` and recovered after cooldown and retry.
+The floor exists because serialization has a hard throughput ceiling. A queue that allows only one request in flight can never exceed one request per service time, so an eleven-second request caps the whole machine near five requests per minute regardless of how many sessions are waiting. Provider faults are retried and cost seconds; queue time is never recovered. An earlier release pinned concurrency to one to drive overload responses to zero, and it produced multi-minute queue waits under normal fanout. Optimize for completed work per minute, not for a zero error count.
+
+This is pacing, not an availability guarantee. Isolated provider failures occur at any concurrency and recover after cooldown and retry.
 
 ## Configuration
 
@@ -47,13 +49,13 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | --- | ---: | --- |
 | `CODEX_PERMIT_GATE_DISABLE` | `0` | Set to `1` to bypass the extension for a Pi process. |
 | `CODEX_PERMIT_GATE_PORT` | `8795` | Local daemon port. All participating sessions must use the same value. |
-| `CODEX_PERMIT_GATE_MIN` | `1` | Minimum daemon concurrency. |
-| `CODEX_PERMIT_GATE_MAX` | `1` | Maximum daemon concurrency. Raising this can restore provider overloads. |
-| `CODEX_PERMIT_GATE_START` | `1` | Initial concurrency, bounded by min and max. |
-| `CODEX_PERMIT_GATE_OVERLOADED_COOLDOWN_MS` | `60000` | Cooldown requested after an overload response. |
-| `CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS` | `20000` | Cooldown requested after a rate-limit response. |
-| `CODEX_PERMIT_GATE_MAX_COOLDOWN_MS` | `60000` | Hard ceiling for any cooldown. |
-| `CODEX_PERMIT_GATE_INCREASE_AFTER_MS` | `120000` | Clean window before increasing toward a configured max above one. |
+| `CODEX_PERMIT_GATE_MIN` | `2` | Throughput floor. Provider backoff never reduces concurrency below this. |
+| `CODEX_PERMIT_GATE_MAX` | `6` | Ceiling the gate may climb to during clean windows. |
+| `CODEX_PERMIT_GATE_START` | `3` | Initial concurrency, bounded by min and max. |
+| `CODEX_PERMIT_GATE_OVERLOADED_COOLDOWN_MS` | `8000` | Cooldown requested after an overload response. |
+| `CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS` | `10000` | Cooldown requested after a rate-limit response. |
+| `CODEX_PERMIT_GATE_MAX_COOLDOWN_MS` | `15000` | Hard ceiling for any cooldown. A cooldown pauses every lane. |
+| `CODEX_PERMIT_GATE_INCREASE_AFTER_MS` | `60000` | Clean window before stepping concurrency back up toward the ceiling. |
 | `CODEX_PERMIT_GATE_PERMIT_TTL_MS` | `300000` | Time without a lease renewal before an abandoned permit is reclaimed. Set to `0` to disable. |
 | `CODEX_PERMIT_GATE_ACQUIRE_WARNING_ATTEMPTS` | `600` | Unsuccessful attempts before reporting prolonged gate unavailability. The request remains blocked and retries continue. |
 | `CODEX_PERMIT_GATE_ACQUIRE_RETRY_MS` | `500` | Delay between unsuccessful permit attempts. |
@@ -76,7 +78,8 @@ The daemon listens only on `127.0.0.1`. Its state and log live under `~/.pi/agen
 ## Limitations and security
 
 - The gate covers Pi's native `openai-codex` provider only.
-- Requests are serialized by default, so a long request can make other sessions wait.
+- Throughput is bounded by concurrency times service time. Sustained demand above that rate still queues, and long requests still make other sessions wait.
+- Daemon settings are read once, when the daemon starts. Because any session can restart a stopped daemon, per-shell environment overrides are unreliable; change the defaults or set the variables for every session that might spawn it.
 - The localhost control plane is unauthenticated. Any process running as the local user can acquire or renew permits, request cooldowns, or occupy the configured port. Renewable leases bound abandoned permits, but they do not defend against a malicious local process.
 - If the gate remains unavailable, the hook stays pending and continues retrying instead of bypassing the concurrency limit. Esc cannot cancel a turn while it is waiting inside this hook. Free the configured port, restore the daemon, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to recover.
 - The extension reduces overload pressure; it cannot prevent provider-side failures.
