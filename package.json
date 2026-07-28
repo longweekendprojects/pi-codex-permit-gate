@@ -1,0 +1,34 @@
+{
+  "name": "pi-codex-permit-gate",
+  "version": "0.1.0",
+  "description": "A shared, fair concurrency gate for native OpenAI Codex requests in Pi.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openai-codex",
+    "concurrency",
+    "rate-limit",
+    "scheduling"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/longweekendprojects/pi-codex-permit-gate.git"
+  },
+  "homepage": "https://github.com/longweekendprojects/pi-codex-permit-gate#readme",
+  "bugs": {
+    "url": "https://github.com/longweekendprojects/pi-codex-permit-gate/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
