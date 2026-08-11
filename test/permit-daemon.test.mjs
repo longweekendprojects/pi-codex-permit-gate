@@ -152,15 +152,55 @@ test("shipped defaults keep several requests in flight and never serialize", asy
   assert.equal(busy.queued, 0);
   assert.equal(busy.peakActive, 3);
 
-  // Sustained provider failures step concurrency down, but never to one.
-  for (let i = 0; i < 6; i++) {
+  for (const holder of holders) await release(daemon.port, holder.body.permitId);
+});
+
+test("an isolated failure respects the throughput floor; a sustained outage backs off past it", async (t) => {
+  const daemon = await startDaemon();
+  t.after(() => daemon.stop());
+
+  const throttle = () => request(daemon.port, "POST", "/throttle", { reason: "overloaded", cooldownMs: 8000 });
+
+  // Below the incident threshold this is an unlucky request, not a degraded
+  // provider, so the throughput floor must hold.
+  await throttle();
+  await throttle();
+  const transient = await getHealth(daemon.port);
+  assert.equal(transient.incident, false);
+  assert.equal(transient.current, 2, "an isolated failure must not breach the throughput floor");
+  assert(transient.cooldownMsRemaining <= 15000, "a transient must not pause lanes for minutes");
+
+  // Sustained failure is an outage. Pushing the floor at a failing provider
+  // yields neither completed work nor recovery, so the floor must give way.
+  await throttle();
+  await throttle();
+  const outage = await getHealth(daemon.port);
+  assert.equal(outage.incident, true);
+  assert.equal(outage.absoluteMin, 1);
+  assert.equal(outage.current, 1, "a sustained outage must back off below the normal floor");
+  assert(outage.cooldownMsRemaining > 15000, "an outage must escalate the pause beyond the transient cap");
+});
+
+test("incident mode clears after a quiet window and a throttle never raises concurrency", async (t) => {
+  const daemon = await startDaemon({ CODEX_PERMIT_GATE_INCIDENT_WINDOW_MS: "1000" });
+  t.after(() => daemon.stop());
+
+  for (let i = 0; i < 3; i++) {
     await request(daemon.port, "POST", "/throttle", { reason: "overloaded", cooldownMs: 1000 });
   }
-  const throttled = await getHealth(daemon.port);
-  assert.equal(throttled.current, 2, "backoff must stop at the throughput floor");
-  assert(throttled.cooldownMsRemaining <= 15000, "a single transient must not freeze lanes for minutes");
+  const during = await getHealth(daemon.port);
+  assert.equal(during.incident, true);
+  assert.equal(during.current, 1);
 
-  for (const holder of holders) await release(daemon.port, holder.body.permitId);
+  await delay(1200);
+  const after = await getHealth(daemon.port);
+  assert.equal(after.incident, false, "incident must clear once failures age out of the window");
+
+  // The normal floor is 2 and concurrency sits at 1, so a naive Math.max would
+  // turn this failure report into an increase.
+  await request(daemon.port, "POST", "/throttle", { reason: "overloaded", cooldownMs: 1000 });
+  const reasserted = await getHealth(daemon.port);
+  assert.equal(reasserted.current, 1, "a throttle must never increase concurrency");
 });
 
 test("daemon enforces one permit and schedules orchestration roots round-robin", async (t) => {

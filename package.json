@@ -1,6 +1,6 @@
 {
   "name": "pi-codex-permit-gate",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A shared, fair concurrency gate for native OpenAI Codex requests in Pi.",
   "type": "module",
   "license": "MIT",

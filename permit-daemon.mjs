@@ -21,6 +21,19 @@ const PORT = parseInt(process.env.CODEX_PERMIT_GATE_PORT || "8795", 10);
 // clean windows walk it back up toward MAX.
 const MIN = Math.max(1, parseInt(process.env.CODEX_PERMIT_GATE_MIN || "2", 10));
 const MAX = Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_MAX || "6", 10));
+// MIN protects throughput against a service-time spike. It must not protect
+// throughput against a provider outage: when failures are sustained, continuing
+// to push two requests at a failing provider produces neither completed work nor
+// a recovering provider. Sustained failure unlocks a deeper floor.
+const ABSOLUTE_MIN = Math.max(1, Math.min(MIN, parseInt(process.env.CODEX_PERMIT_GATE_ABSOLUTE_MIN || "1", 10)));
+const INCIDENT_THRESHOLD = Math.max(2, parseInt(process.env.CODEX_PERMIT_GATE_INCIDENT_THRESHOLD || "3", 10));
+const INCIDENT_WINDOW_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_INCIDENT_WINDOW_MS || "120000", 10));
+// During an incident a longer pause is correct: the cost of waiting is bounded,
+// while the cost of retrying into an outage is wasted turns and more errors.
+const INCIDENT_MAX_COOLDOWN_MS = Math.max(1000, parseInt(process.env.CODEX_PERMIT_GATE_INCIDENT_MAX_COOLDOWN_MS || "60000", 10));
+// Ramping back up mid-incident is what produced the observed 2->3->2 flapping,
+// so recovery demands a longer quiet period than an ordinary clean window.
+const INCIDENT_RECOVERY_FACTOR = Math.max(1, parseInt(process.env.CODEX_PERMIT_GATE_INCIDENT_RECOVERY_FACTOR || "3", 10));
 let current = Math.min(MAX, Math.max(MIN, parseInt(process.env.CODEX_PERMIT_GATE_START || "3", 10)));
 // A cooldown pauses every lane, so it is priced in seconds. Provider faults are
 // retried; queue time is not recoverable.
@@ -56,6 +69,14 @@ const grantsByGroup = new Map(); // group -> cumulative grants, for round-robin 
 const rr = [];
 let cooldownUntil = 0;
 let lastThrottleAt = 0;
+const throttleTimes = [];
+// An incident is sustained failure, not a single bad response. Several throttles
+// inside one window means the provider is degraded rather than briefly unlucky.
+function incidentActive(now = Date.now()) {
+  const cutoff = now - INCIDENT_WINDOW_MS;
+  while (throttleTimes.length && throttleTimes[0] < cutoff) throttleTimes.shift();
+  return throttleTimes.length >= INCIDENT_THRESHOLD;
+}
 let lastIncreaseAt = Date.now();
 let pumpTimer;
 
@@ -156,7 +177,8 @@ function maybeIncrease() {
   const now = Date.now();
   if (current >= MAX) return;
   if (now < cooldownUntil) return;
-  if (now - lastThrottleAt < INCREASE_AFTER_MS) return;
+  const quietRequired = incidentActive(now) ? INCREASE_AFTER_MS * INCIDENT_RECOVERY_FACTOR : INCREASE_AFTER_MS;
+  if (now - lastThrottleAt < quietRequired) return;
   if (now - lastIncreaseAt < INCREASE_AFTER_MS) return;
   const before = current;
   current++;
@@ -182,16 +204,25 @@ function throttle(reason, cooldownMs = COOLDOWN_MS) {
   // Bound every cooldown to MAX_COOLDOWN_MS. This is the backstop that keeps a
   // single throttle (or several sessions each reporting one) from compounding
   // into a multi-minute freeze of an otherwise idle lane.
+  const now = Date.now();
+  throttleTimes.push(now);
+  const incident = incidentActive(now);
   const requested = Math.max(1000, Number(cooldownMs) || COOLDOWN_MS);
-  const effectiveCooldownMs = Math.min(requested, MAX_COOLDOWN_MS);
+  // Back off harder the longer an incident persists, bounded by the incident cap.
+  const escalations = incident ? Math.min(throttleTimes.length - INCIDENT_THRESHOLD + 1, 4) : 0;
+  const ceiling = incident ? INCIDENT_MAX_COOLDOWN_MS : MAX_COOLDOWN_MS;
+  const effectiveCooldownMs = Math.min(requested * Math.pow(2, escalations), ceiling);
   stats.throttles++;
-  lastThrottleAt = Date.now();
+  lastThrottleAt = now;
   // Take the later of the existing window and the new one, still bounded, so a
   // burst of throttles paces rather than ratchets indefinitely.
-  cooldownUntil = Math.min(Date.now() + MAX_COOLDOWN_MS, Math.max(cooldownUntil, Date.now() + effectiveCooldownMs));
+  cooldownUntil = Math.min(now + ceiling, Math.max(cooldownUntil, now + effectiveCooldownMs));
   const before = current;
-  current = Math.max(MIN, current - 1);
-  log(`throttle(${reason}): concurrency ${before} -> ${current}; cooldown ${effectiveCooldownMs}ms`);
+  const floor = incident ? ABSOLUTE_MIN : MIN;
+  // Never let reasserting a higher normal floor turn a failure report into an
+  // increase. Climbing back is the clean-window path's job, not a throttle's.
+  current = Math.min(current, Math.max(floor, current - 1));
+  log(`throttle(${reason}): concurrency ${before} -> ${current}; cooldown ${effectiveCooldownMs}ms${incident ? `; incident (${throttleTimes.length} throttles/${Math.round(INCIDENT_WINDOW_MS / 1000)}s, floor ${floor})` : ""}`);
   schedulePump(effectiveCooldownMs);
 }
 function sweepStalePermits() {
@@ -216,7 +247,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     sweepStalePermits();
     const s = snapshot();
-    json(res, 200, { ok: true, version: 2, active: active.size, min: MIN, current, max: MAX, cooldownMsRemaining: Math.max(0, cooldownUntil - Date.now()), ...s, ...stats });
+    json(res, 200, { ok: true, version: 3, active: active.size, min: MIN, absoluteMin: ABSOLUTE_MIN, current, max: MAX, incident: incidentActive(), recentThrottles: throttleTimes.length, cooldownMsRemaining: Math.max(0, cooldownUntil - Date.now()), ...s, ...stats });
     return;
   }
   if (req.method === "POST" && req.url === "/acquire") {
