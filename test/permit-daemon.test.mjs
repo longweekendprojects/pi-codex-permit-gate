@@ -255,6 +255,31 @@ test("daemon enforces one permit and schedules orchestration roots round-robin",
   assert.equal(finalHealth.groups.D.granted, 2);
 });
 
+test("releases a grant when its queued client disconnects before the response flushes", async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "pi-codex-permit-gate-test-"));
+  const preload = path.join(home, "delay-grant-response.cjs");
+  await fs.writeFile(preload, `const http = require("node:http"); const end = http.ServerResponse.prototype.end; http.ServerResponse.prototype.end = function(chunk, ...args) { if (String(chunk).includes("\\\"permitId\\\"")) { setTimeout(() => end.call(this, chunk, ...args), 100); return this; } return end.call(this, chunk, ...args); };`);
+  const port = await unusedPort();
+  const child = await startDaemon({ ...SERIALIZED, CODEX_PERMIT_GATE_PORT: String(port), HOME: home, NODE_OPTIONS: `--require=${preload}` });
+  t.after(async () => { await child.stop(); await fs.rm(home, { recursive: true, force: true }); });
+
+  const holder = await acquire(port, "holder");
+  const disconnected = new Promise((resolve) => {
+    const payload = JSON.stringify({ group: "waiting", session: "waiting" });
+    const req = http.request({ host: "127.0.0.1", port, method: "POST", path: "/acquire", headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) } });
+    req.once("error", resolve);
+    req.end(payload);
+    child.disconnect = () => req.destroy();
+  });
+  await waitForQueued(port, 1);
+  await release(port, holder.body.permitId);
+  await waitFor(async () => (await getHealth(port)).active === 1, "queued request was not granted");
+  child.disconnect();
+  await disconnected;
+  await waitFor(async () => (await getHealth(port)).active === 0, "disconnected grant remained active");
+  assert.equal((await getHealth(port)).released, 2);
+});
+
 test("throttle paces the next grant and unknown releases are idempotent", async (t) => {
   const daemon = await startDaemon(SERIALIZED);
   t.after(() => daemon.stop());

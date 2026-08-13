@@ -87,8 +87,9 @@ function getJson<T = any>(pathName = "/health", timeoutMs = 1000): Promise<T | u
   });
 }
 
-function postJson<T = any>(pathName: string, body: any, timeoutMs = 7200000): Promise<T> {
+function postJson<T = any>(pathName: string, body: any, timeoutMs = 7200000, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(abortError()); return; }
     const payload = JSON.stringify(body || {});
     const req = http.request(`${BASE}${pathName}`, {
       method: "POST",
@@ -102,9 +103,23 @@ function postJson<T = any>(pathName: string, body: any, timeoutMs = 7200000): Pr
         try { resolve(buf ? JSON.parse(buf) : {}); } catch (err) { reject(err); }
       });
     });
+    const abort = () => req.destroy(abortError());
+    signal?.addEventListener("abort", abort, { once: true });
     req.on("timeout", () => req.destroy(new Error("permit acquire timed out")));
     req.on("error", reject);
+    req.on("close", () => signal?.removeEventListener("abort", abort));
     req.end(payload);
+  });
+}
+function abortError() { return Object.assign(new Error("permit acquisition aborted"), { name: "AbortError" }); }
+function isAborted(signal?: AbortSignal) { return signal?.aborted === true; }
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (isAborted(signal)) { reject(abortError()); return; }
+    const timer = setTimeout(done, ms);
+    const abort = () => { clearTimeout(timer); done(abortError()); };
+    function done(error?: Error) { signal?.removeEventListener("abort", abort); error ? reject(error) : resolve(); }
+    signal?.addEventListener("abort", abort, { once: true });
   });
 }
 
@@ -121,19 +136,21 @@ async function ensureDaemon(dir: string): Promise<void> {
 type AcquireOptions = {
   warningAfterAttempts?: number;
   retryMs?: number;
-  request?: (pathName: string, body: any) => Promise<any>;
+  request?: (pathName: string, body: any, signal?: AbortSignal) => Promise<any>;
   ensure?: (dir: string) => Promise<void>;
-  wait?: (ms: number) => Promise<unknown>;
+  wait?: (ms: number, signal?: AbortSignal) => Promise<unknown>;
   onUnavailable?: (message: string) => void;
+  signal?: AbortSignal;
 };
 
 // Exported for a focused fail-closed test. Production callers use the defaults.
 export async function acquirePermitResponse(body: any, dir: string, options: AcquireOptions = {}): Promise<any> {
   const warningAfterAttempts = options.warningAfterAttempts ?? ACQUIRE_WARNING_ATTEMPTS;
   const retryMs = options.retryMs ?? ACQUIRE_RETRY_MS;
-  const request = options.request ?? ((pathName, payload) => postJson(pathName, payload));
+  const signal = options.signal;
+  const request = options.request ?? ((pathName, payload, requestSignal) => postJson(pathName, payload, 7200000, requestSignal));
   const ensure = options.ensure ?? ensureDaemon;
-  const wait = options.wait ?? sleep;
+  const wait = options.wait ?? waitForRetry;
   let warned = false;
 
   // Pi's before_provider_request runner logs and swallows handler exceptions.
@@ -141,9 +158,18 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   // a permit would let the native provider send the request ungated. Keep
   // retrying across daemon restarts and report prolonged unavailability once.
   for (let attempt = 1; ; attempt++) {
+    if (isAborted(signal)) throw abortError();
     let res: any;
-    try { res = await request("/acquire", body); } catch {}
-    if (res?.permitId) return res;
+    try { res = await request("/acquire", body, signal); } catch (error) {
+      if (isAborted(signal) || (error as Error)?.name === "AbortError") throw abortError();
+    }
+    if (res?.permitId) {
+      if (isAborted(signal)) {
+        await postJson("/release", { permitId: res.permitId }, 5000).catch(() => {});
+        throw abortError();
+      }
+      return res;
+    }
 
     try { await ensure(dir); } catch {}
     if (!warned && attempt >= warningAfterAttempts) {
@@ -152,7 +178,7 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
         options.onUnavailable?.(`Codex permit gate unavailable after ${attempt} attempts; provider request remains blocked`);
       } catch {}
     }
-    await wait(retryMs);
+    await wait(retryMs, signal);
   }
 }
 
@@ -171,20 +197,31 @@ function startPermitRenewal(permitId: string, permitTtlMs: number): ReturnType<t
 }
 
 async function acquirePermit(ctx: any, dir: string): Promise<void> {
-  if (activePermit) return;
+  if (activePermit || isAborted(ctx.signal)) return;
   ctx.ui?.setStatus?.("codex-permit-gate", "Codex: waiting for permit...");
-  const res = await acquirePermitResponse({ group, session: sessionId, cwd: ctx.cwd }, dir, {
-    onUnavailable: (message) => {
-      ctx.ui?.setStatus?.("codex-permit-gate", "Codex: blocked; permit gate unavailable");
-      ctx.ui?.notify?.(message, "error");
-    },
-  });
-  const permitId = String(res.permitId);
-  activePermit = { permitId };
-  activePermit.renewTimer = startPermitRenewal(permitId, Number(res.permitTtlMs || 0));
-  const waited = Number(res.waitedMs || 0);
-  ctx.ui?.setStatus?.("codex-permit-gate", waited > 1000 ? `Codex: permit after ${Math.round(waited / 1000)}s` : "Codex: permit active");
-  if (VERBOSE) ctx.ui?.notify?.(`Codex permit granted after ${waited}ms`, "info");
+  try {
+    const res = await acquirePermitResponse({ group, session: sessionId, cwd: ctx.cwd }, dir, {
+      signal: ctx.signal,
+      onUnavailable: (message) => {
+        ctx.ui?.setStatus?.("codex-permit-gate", "Codex: blocked; permit gate unavailable");
+        ctx.ui?.notify?.(message, "error");
+      },
+    });
+    if (isAborted(ctx.signal)) {
+      await postJson("/release", { permitId: res.permitId }, 5000).catch(() => {});
+      return;
+    }
+    const permitId = String(res.permitId);
+    activePermit = { permitId };
+    activePermit.renewTimer = startPermitRenewal(permitId, Number(res.permitTtlMs || 0));
+    const waited = Number(res.waitedMs || 0);
+    ctx.ui?.setStatus?.("codex-permit-gate", waited > 1000 ? `Codex: permit after ${Math.round(waited / 1000)}s` : "Codex: permit active");
+    if (VERBOSE) ctx.ui?.notify?.(`Codex permit granted after ${waited}ms`, "info");
+  } catch (error) {
+    if (!isAborted(ctx.signal) && (error as Error)?.name !== "AbortError") throw error;
+  } finally {
+    if (isAborted(ctx.signal)) ctx.ui?.setStatus?.("codex-permit-gate", undefined);
+  }
 }
 
 async function releasePermit(throttle: boolean, reason: string, cooldownMs?: number): Promise<void> {

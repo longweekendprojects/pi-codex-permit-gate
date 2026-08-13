@@ -83,3 +83,21 @@ test("permit acquisition can recover after reporting prolonged unavailability", 
   assert.equal(requests, 4);
   assert.equal(warnings, 1);
 });
+
+test("aborting an acquire stops the in-flight request and retry loop", async () => {
+  const controller = new AbortController();
+  let requests = 0;
+  const pending = acquirePermitResponse({ group: "root", session: "leaf" }, "/unused", {
+    signal: controller.signal,
+    request: async (_path, _body, signal) => {
+      requests++;
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })), { once: true }));
+    },
+    ensure: async () => { throw new Error("must not retry after abort"); },
+    wait: async () => { throw new Error("must not sleep after abort"); },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort();
+  await assert.rejects(pending, { name: "AbortError" });
+  assert.equal(requests, 1);
+});

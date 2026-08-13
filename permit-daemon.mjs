@@ -134,6 +134,10 @@ function enqueue(group, session, res) {
   q.push(req);
   if (!rr.includes(group)) rr.push(group);
   req.cancel = () => {
+    if (req.permitId) {
+      if (!req.responseFinished) releasePermit(req.permitId);
+      return;
+    }
     if (req.done) return;
     req.done = true;
     const q = lanes.get(group);
@@ -163,13 +167,14 @@ function pump() {
     else lanes.delete(group);
     if (req.done) continue;
     req.done = true;
-    req.res.removeListener("close", req.cancel);
     const permitId = crypto.randomUUID();
     const grantedAt = Date.now();
+    req.permitId = permitId;
     active.set(permitId, { group, session: req.session, grantedAt, renewedAt: grantedAt });
     stats.granted++;
     grantsByGroup.set(group, (grantsByGroup.get(group) || 0) + 1);
     stats.peakActive = Math.max(stats.peakActive, active.size);
+    req.res.once("finish", () => { req.responseFinished = true; req.res.removeListener("close", req.cancel); });
     json(req.res, 200, { ok: true, permitId, waitedMs: Date.now() - req.enqueuedAt, current, max: MAX, permitTtlMs: PERMIT_TTL_MS });
   }
 }

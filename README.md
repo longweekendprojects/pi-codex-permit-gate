@@ -89,7 +89,8 @@ The daemon listens only on `127.0.0.1`. Its state and log live under `~/.pi/agen
 - Throughput is bounded by concurrency times service time. Sustained demand above that rate still queues, and long requests still make other sessions wait.
 - Daemon settings are read once, when the daemon starts. Because any session can restart a stopped daemon, per-shell environment overrides are unreliable; change the defaults or set the variables for every session that might spawn it.
 - The localhost control plane is unauthenticated. Any process running as the local user can acquire or renew permits, request cooldowns, or occupy the configured port. Renewable leases bound abandoned permits, but they do not defend against a malicious local process.
-- If the gate remains unavailable, the hook stays pending and continues retrying instead of bypassing the concurrency limit. Esc cannot cancel a turn while it is waiting inside this hook. Free the configured port, restore the daemon, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to recover.
+- If the gate remains unavailable, the hook stays pending and continues retrying instead of bypassing the concurrency limit. Esc cancels its permit wait without bypassing the concurrency limit, so the gate no longer holds the turn hostage. Free the configured port, restore the daemon, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to recover.
+- With the WebSocket transport, pi-ai can reuse a warm cached socket and send `response.create` before checking the abort signal. A request cancelled during the permit wait may therefore still be sent once and immediately abandoned. Eliminating that residual race needs a Pi-side pre-transport abort guard.
 - The extension reduces overload pressure; it cannot prevent provider-side failures.
 - Every Pi process that should participate must load the extension and use the same port.
 
