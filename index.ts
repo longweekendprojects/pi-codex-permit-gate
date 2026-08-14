@@ -34,8 +34,27 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const DISABLED = process.env.CODEX_PERMIT_GATE_DISABLE === "1";
-const PORT = parseInt(process.env.CODEX_PERMIT_GATE_PORT || "8795", 10);
-const BASE = `http://127.0.0.1:${PORT}`;
+const DEFAULT_PROVIDER_PORTS = new Map<string, number>([
+  ["openai-codex", 8795],
+  ["openai-codex-a", 8796],
+  ["openai-codex-b", 8797],
+]);
+
+// An explicit map replaces the defaults. This lets users opt into only the
+// accounts they have configured while keeping each account's queue independent.
+export function parseProviderPorts(value: string | undefined): Map<string, number> {
+  if (value === undefined) return new Map(DEFAULT_PROVIDER_PORTS);
+  const ports = new Map<string, number>();
+  for (const entry of value.split(",")) {
+    const match = entry.trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]*):(\d+)$/);
+    if (!match) continue;
+    const port = Number(match[2]);
+    if (Number.isInteger(port) && port >= 1 && port <= 65535) ports.set(match[1], port);
+  }
+  return ports;
+}
+
+const PROVIDER_PORTS = parseProviderPorts(process.env.CODEX_PERMIT_GATE_PROVIDER_PORTS);
 const VERBOSE = process.env.CODEX_PERMIT_GATE_VERBOSE === "1";
 const GROUP_ENV = "CODEX_PERMIT_GATE_GROUP";
 function positiveEnvInt(name: string, fallback: number, minimum: number): number {
@@ -53,7 +72,7 @@ const ACQUIRE_RETRY_MS = positiveEnvInt("CODEX_PERMIT_GATE_ACQUIRE_RETRY_MS", 50
 const INHERITED_GROUP = process.env[GROUP_ENV];
 const IS_SUBAGENT_CHILD = process.env.PI_SUBAGENT_CHILD === "1";
 
-let activePermit: { permitId: string; renewTimer?: ReturnType<typeof setInterval> } | undefined;
+let activePermit: { permitId: string; port: number; renewTimer?: ReturnType<typeof setInterval> } | undefined;
 let sessionId = "unknown";
 let group = "unknown";
 
@@ -74,9 +93,17 @@ function resolveGroup(ctx: any): string {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function getJson<T = any>(pathName = "/health", timeoutMs = 1000): Promise<T | undefined> {
+function providerPort(provider?: string): number | undefined {
+  return provider ? PROVIDER_PORTS.get(provider) : undefined;
+}
+
+function providerLabel(provider: string): string {
+  return `Codex (${provider})`;
+}
+
+function getJson<T = any>(port: number, pathName = "/health", timeoutMs = 1000): Promise<T | undefined> {
   return new Promise((resolve) => {
-    const req = http.get(`${BASE}${pathName}`, { timeout: timeoutMs }, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}${pathName}`, { timeout: timeoutMs }, (res) => {
       let buf = "";
       res.setEncoding("utf8");
       res.on("data", (c) => { buf += c; });
@@ -87,11 +114,11 @@ function getJson<T = any>(pathName = "/health", timeoutMs = 1000): Promise<T | u
   });
 }
 
-function postJson<T = any>(pathName: string, body: any, timeoutMs = 7200000, signal?: AbortSignal): Promise<T> {
+function postJson<T = any>(port: number, pathName: string, body: any, timeoutMs = 7200000, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(abortError()); return; }
     const payload = JSON.stringify(body || {});
-    const req = http.request(`${BASE}${pathName}`, {
+    const req = http.request(`http://127.0.0.1:${port}${pathName}`, {
       method: "POST",
       timeout: timeoutMs,
       headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
@@ -123,12 +150,12 @@ function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function ensureDaemon(dir: string): Promise<void> {
-  if ((await getJson())?.ok) return;
+async function ensureDaemon(dir: string, port: number): Promise<void> {
+  if ((await getJson(port))?.ok) return;
   const child = spawn(process.execPath, [path.join(dir, "permit-daemon.mjs")], {
     detached: true,
     stdio: "ignore",
-    env: { ...process.env, CODEX_PERMIT_GATE_PORT: String(PORT) },
+    env: { ...process.env, CODEX_PERMIT_GATE_PORT: String(port) },
   });
   child.unref();
 }
@@ -140,6 +167,7 @@ type AcquireOptions = {
   ensure?: (dir: string) => Promise<void>;
   wait?: (ms: number, signal?: AbortSignal) => Promise<unknown>;
   onUnavailable?: (message: string) => void;
+  port?: number;
   signal?: AbortSignal;
 };
 
@@ -148,8 +176,9 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   const warningAfterAttempts = options.warningAfterAttempts ?? ACQUIRE_WARNING_ATTEMPTS;
   const retryMs = options.retryMs ?? ACQUIRE_RETRY_MS;
   const signal = options.signal;
-  const request = options.request ?? ((pathName, payload, requestSignal) => postJson(pathName, payload, 7200000, requestSignal));
-  const ensure = options.ensure ?? ensureDaemon;
+  const port = options.port ?? 0;
+  const request = options.request ?? ((pathName, payload, requestSignal) => postJson(port, pathName, payload, 7200000, requestSignal));
+  const ensure = options.ensure ?? ((daemonDir) => ensureDaemon(daemonDir, port));
   const wait = options.wait ?? waitForRetry;
   let warned = false;
 
@@ -165,7 +194,7 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
     }
     if (res?.permitId) {
       if (isAborted(signal)) {
-        await postJson("/release", { permitId: res.permitId }, 5000).catch(() => {});
+        await postJson(port, "/release", { permitId: res.permitId }, 5000).catch(() => {});
         throw abortError();
       }
       return res;
@@ -182,12 +211,12 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   }
 }
 
-function startPermitRenewal(permitId: string, permitTtlMs: number): ReturnType<typeof setInterval> | undefined {
+function startPermitRenewal(permitId: string, permitTtlMs: number, port: number): ReturnType<typeof setInterval> | undefined {
   if (!Number.isFinite(permitTtlMs) || permitTtlMs <= 0) return undefined;
   const renewEveryMs = Math.max(10, Math.min(60000, Math.floor(permitTtlMs / 3)));
   const timer = setInterval(async () => {
-    if (activePermit?.permitId !== permitId) return;
-    try { await postJson("/renew", { permitId }, 5000); } catch {
+    if (activePermit?.permitId !== permitId || activePermit.port !== port) return;
+    try { await postJson(port, "/renew", { permitId }, 5000); } catch {
       // A daemon restart loses lease state. The provider request already owns
       // its permit, so release/error handling remains best-effort as before.
     }
@@ -196,27 +225,29 @@ function startPermitRenewal(permitId: string, permitTtlMs: number): ReturnType<t
   return timer;
 }
 
-async function acquirePermit(ctx: any, dir: string): Promise<void> {
+async function acquirePermit(ctx: any, dir: string, provider: string, port: number): Promise<void> {
   if (activePermit || isAborted(ctx.signal)) return;
-  ctx.ui?.setStatus?.("codex-permit-gate", "Codex: waiting for permit...");
+  const label = providerLabel(provider);
+  ctx.ui?.setStatus?.("codex-permit-gate", `${label}: waiting for permit...`);
   try {
     const res = await acquirePermitResponse({ group, session: sessionId, cwd: ctx.cwd }, dir, {
+      port,
       signal: ctx.signal,
       onUnavailable: (message) => {
-        ctx.ui?.setStatus?.("codex-permit-gate", "Codex: blocked; permit gate unavailable");
+        ctx.ui?.setStatus?.("codex-permit-gate", `${label}: blocked; permit gate unavailable`);
         ctx.ui?.notify?.(message, "error");
       },
     });
     if (isAborted(ctx.signal)) {
-      await postJson("/release", { permitId: res.permitId }, 5000).catch(() => {});
+      await postJson(port, "/release", { permitId: res.permitId }, 5000).catch(() => {});
       return;
     }
     const permitId = String(res.permitId);
-    activePermit = { permitId };
-    activePermit.renewTimer = startPermitRenewal(permitId, Number(res.permitTtlMs || 0));
+    activePermit = { permitId, port };
+    activePermit.renewTimer = startPermitRenewal(permitId, Number(res.permitTtlMs || 0), port);
     const waited = Number(res.waitedMs || 0);
-    ctx.ui?.setStatus?.("codex-permit-gate", waited > 1000 ? `Codex: permit after ${Math.round(waited / 1000)}s` : "Codex: permit active");
-    if (VERBOSE) ctx.ui?.notify?.(`Codex permit granted after ${waited}ms`, "info");
+    ctx.ui?.setStatus?.("codex-permit-gate", waited > 1000 ? `${label}: permit after ${Math.round(waited / 1000)}s` : `${label}: permit active`);
+    if (VERBOSE) ctx.ui?.notify?.(`${label} permit granted after ${waited}ms`, "info");
   } catch (error) {
     if (!isAborted(ctx.signal) && (error as Error)?.name !== "AbortError") throw error;
   } finally {
@@ -230,7 +261,7 @@ async function releasePermit(throttle: boolean, reason: string, cooldownMs?: num
   activePermit = undefined;
   if (p.renewTimer) clearInterval(p.renewTimer);
   try {
-    await postJson(throttle ? "/throttle" : "/release", { permitId: p.permitId, reason, cooldownMs }, 5000);
+    await postJson(p.port, throttle ? "/throttle" : "/release", { permitId: p.permitId, reason, cooldownMs }, 5000);
   } catch {
     // The daemon may have restarted; do not block the session on release cleanup.
   }
@@ -266,22 +297,25 @@ export default async function (pi: ExtensionAPI) {
     // Export unconditionally, before any provider check: a Claude or local-model
     // parent still has to hand its group to Codex children it spawns.
     process.env[GROUP_ENV] = group;
-    if (ctx.model?.provider !== "openai-codex") return;
-    await ensureDaemon(dir);
-    if (ctx.hasUI) ctx.ui.setStatus("codex-permit-gate", "Codex gate: ready");
+    const port = providerPort(ctx.model?.provider);
+    if (!port) return;
+    await ensureDaemon(dir, port);
+    if (ctx.hasUI) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(ctx.model.provider)} gate: ready`);
   });
 
   pi.on("model_select", async (event: any, ctx: any) => {
     if (!ctx.hasUI) return;
-    if (event.model?.provider === "openai-codex") ctx.ui.setStatus("codex-permit-gate", "Codex gate: ready");
+    const provider = event.model?.provider;
+    if (providerPort(provider)) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider)} gate: ready`);
     else ctx.ui.setStatus("codex-permit-gate", undefined);
   });
 
   pi.on("before_provider_request", async (_event, ctx) => {
     const model = ctx.model;
-    if (!model || model.provider !== "openai-codex") return undefined;
-    await ensureDaemon(dir);
-    await acquirePermit(ctx, dir);
+    const port = providerPort(model?.provider);
+    if (!model || !port) return undefined;
+    await ensureDaemon(dir, port);
+    await acquirePermit(ctx, dir, model.provider, port);
     return undefined;
   });
 
@@ -289,7 +323,8 @@ export default async function (pi: ExtensionAPI) {
     if (!activePermit || event.message.role !== "assistant") return undefined;
     const failure = classifyProviderFailure(event.message);
     await releasePermit(!!failure, failure ? `assistant-${failure}` : "assistant-end", failure ? cooldownForFailure(failure) : undefined);
-    if (ctx.hasUI && ctx.model?.provider === "openai-codex") ctx.ui.setStatus("codex-permit-gate", "Codex gate: ready");
+    const provider = ctx.model?.provider;
+    if (ctx.hasUI && providerPort(provider)) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider)} gate: ready`);
     return undefined;
   });
 
@@ -299,30 +334,31 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("codex-permit", {
     description: "Show the Codex permit gate status: /codex-permit",
     handler: async (_args, ctx) => {
-      const h = await getJson("/health");
-      if (!h?.ok) {
-        ctx.ui.notify(`Codex permit gate: daemon stopped on 127.0.0.1:${PORT} (starts on the next Codex request).`, "warning");
-        return;
-      }
-      const groups = Object.entries(h.groups || {}) as [string, any][];
-      const groupLines = groups
-        .sort((a, b) => Number(b[1].queued || 0) - Number(a[1].queued || 0))
-        .map(([id, g]) => {
-          const mark = id === group ? "*" : " ";
-          const wait = Math.round(Number(g.oldestWaitMs || 0) / 1000);
-          const sessions = Number(g.sessions?.length || 0);
-          return `  ${mark} ${id}: active ${g.active}, queued ${g.queued}${sessions > 1 ? ` (${sessions} sessions)` : ""}, granted ${g.granted}, oldest wait ${wait}s`;
-        });
-      ctx.ui.notify(
-        [
-          `Codex permit gate (127.0.0.1:${PORT}):`,
+      const pools = await Promise.all([...PROVIDER_PORTS].map(async ([provider, port]) => ({ provider, port, health: await getJson(port, "/health") })));
+      const poolLines = pools.flatMap(({ provider, port, health: h }) => {
+        const header = `${provider} (127.0.0.1:${port}):`;
+        if (!h?.ok) return [`${header} daemon stopped (starts on the next ${provider} request).`];
+        const groups = Object.entries(h.groups || {}) as [string, any][];
+        const groupLines = groups
+          .sort((a, b) => Number(b[1].queued || 0) - Number(a[1].queued || 0))
+          .map(([id, g]) => {
+            const mark = id === group ? "*" : " ";
+            const wait = Math.round(Number(g.oldestWaitMs || 0) / 1000);
+            const sessions = Number(g.sessions?.length || 0);
+            return `    ${mark} ${id}: active ${g.active}, queued ${g.queued}${sessions > 1 ? ` (${sessions} sessions)` : ""}, granted ${g.granted}, oldest wait ${wait}s`;
+          });
+        return [
+          header,
           `  concurrency ${h.current}/${h.max}, active ${h.active}, queued ${h.queued}`,
           `  cooldown remaining ${Math.round(Number(h.cooldownMsRemaining || 0) / 1000)}s`,
           `  granted ${h.granted}, released ${h.released}, throttles ${h.throttles}, expired ${h.expired}`,
           `  peak active ${h.peakActive}, peak queued ${h.peakQueued}, peak wait ${Math.round(Number(h.peakOldestWaitMs || 0) / 1000)}s`,
-          groupLines.length ? "Groups (one per top-level session; * = this session):" : "Groups: none active",
+          groupLines.length ? "  Groups (one per top-level session; * = this session):" : "  Groups: none active",
           ...groupLines,
-        ].join("\n"),
+        ];
+      });
+      ctx.ui.notify(
+        poolLines.length ? ["Codex permit pools:", ...poolLines].join("\n") : "Codex permit gate: no provider pools are configured.",
         "info",
       );
     },

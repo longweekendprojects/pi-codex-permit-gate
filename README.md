@@ -2,7 +2,7 @@
 
 A shared, fair concurrency gate for native OpenAI Codex requests in [Pi](https://github.com/badlogic/pi-mono).
 
-When several Pi sessions call Codex at once, provider overloads can increase and a session with many subagents can crowd out other work. This extension places native `openai-codex` requests behind one local permit queue. It sends one request at a time by default and gives each top-level Pi session an equal turn, including all of its subagents.
+When several Pi sessions call Codex at once, provider overloads can increase and a session with many subagents can crowd out other work. This extension gives each mapped Codex account its own local permit queue. It sends one request at a time by default and gives each top-level Pi session an equal turn, including all of its subagents.
 
 ## Install
 
@@ -22,7 +22,7 @@ The extension starts its local daemon on demand. Non-Codex providers bypass the 
 
 ## What it does
 
-- Caps Codex concurrency across all local Pi processes.
+- Caps concurrency independently for each mapped Codex account across local Pi processes.
 - Schedules requests round-robin by top-level orchestration session.
 - Treats a parent's Codex subagents as one scheduling group, so fanout does not buy extra turns.
 - Exports the scheduling group from Claude and other non-Codex parents, allowing their native Codex children to join the same queue.
@@ -51,7 +51,7 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `CODEX_PERMIT_GATE_DISABLE` | `0` | Set to `1` to bypass the extension for a Pi process. |
-| `CODEX_PERMIT_GATE_PORT` | `8795` | Local daemon port. All participating sessions must use the same value. |
+| `CODEX_PERMIT_GATE_PROVIDER_PORTS` | `openai-codex:8795,openai-codex-a:8796,openai-codex-b:8797` | Complete comma-separated provider-to-port map. An explicit map replaces these defaults; invalid entries are ignored. |
 | `CODEX_PERMIT_GATE_MIN` | `2` | Throughput floor for isolated failures. Sustained failure overrides it. |
 | `CODEX_PERMIT_GATE_ABSOLUTE_MIN` | `1` | Floor during an incident. Never above `MIN`. |
 | `CODEX_PERMIT_GATE_INCIDENT_THRESHOLD` | `3` | Failures inside one window that mark the provider degraded. |
@@ -85,18 +85,18 @@ The daemon listens only on `127.0.0.1`. Its state and log live under `~/.pi/agen
 
 ## Limitations and security
 
-- The gate covers Pi's native `openai-codex` provider only.
+- The gate covers only providers listed in `CODEX_PERMIT_GATE_PROVIDER_PORTS`; the default map includes `openai-codex`, `openai-codex-a`, and `openai-codex-b`.
 - Throughput is bounded by concurrency times service time. Sustained demand above that rate still queues, and long requests still make other sessions wait.
 - Daemon settings are read once, when the daemon starts. Because any session can restart a stopped daemon, per-shell environment overrides are unreliable; change the defaults or set the variables for every session that might spawn it.
 - The localhost control plane is unauthenticated. Any process running as the local user can acquire or renew permits, request cooldowns, or occupy the configured port. Renewable leases bound abandoned permits, but they do not defend against a malicious local process.
 - If the gate remains unavailable, the hook stays pending and continues retrying instead of bypassing the concurrency limit. Esc cancels its permit wait without bypassing the concurrency limit, so the gate no longer holds the turn hostage. Free the configured port, restore the daemon, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to recover.
 - With the WebSocket transport, pi-ai can reuse a warm cached socket and send `response.create` before checking the abort signal. A request cancelled during the permit wait may therefore still be sent once and immediately abandoned. Eliminating that residual race needs a Pi-side pre-transport abort guard.
 - The extension reduces overload pressure; it cannot prevent provider-side failures.
-- Every Pi process that should participate must load the extension and use the same port.
+- Every Pi process that should participate must load the extension and use the same provider-to-port map.
 
 ## Operations
 
-Raw health is available locally:
+Raw health is available locally for each mapped pool. For the default primary account:
 
 ```bash
 curl http://127.0.0.1:8795/health

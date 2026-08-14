@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { acquirePermitResponse } from "../index.ts";
+import { acquirePermitResponse, parseProviderPorts } from "../index.ts";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const source = await fs.readFile(path.join(root, "index.ts"), "utf8");
@@ -29,12 +29,32 @@ test("only recognized subagent children inherit an orchestration group", () => {
   assert.equal(loadResolveGroup(true, "")(context("child-without-root")), "child-without-root");
 });
 
-test("non-Codex parents export their group before the provider guard", () => {
+test("unmapped parents export their group before the provider pool guard", () => {
   const exportPosition = source.indexOf("process.env[GROUP_ENV] = group;");
-  const providerGuardPosition = source.indexOf('if (ctx.model?.provider !== "openai-codex") return;');
+  const providerGuardPosition = source.indexOf("const port = providerPort(ctx.model?.provider);");
   assert(exportPosition >= 0, "group export is missing");
-  assert(providerGuardPosition >= 0, "provider guard is missing");
-  assert(exportPosition < providerGuardPosition, "provider guard prevents parent group export");
+  assert(providerGuardPosition >= 0, "provider pool guard is missing");
+  assert(exportPosition < providerGuardPosition, "provider pool guard prevents parent group export");
+});
+
+test("provider-port mapping uses defaults only when unset and ignores invalid explicit entries", () => {
+  assert.deepEqual([...parseProviderPorts(undefined)], [
+    ["openai-codex", 8795],
+    ["openai-codex-a", 8796],
+    ["openai-codex-b", 8797],
+  ]);
+  assert.deepEqual([...parseProviderPorts("openai-codex-a:9001, invalid, openai-codex-b:0, custom.pool:65535, :9002")], [
+    ["openai-codex-a", 9001],
+    ["custom.pool", 65535],
+  ]);
+});
+
+test("active permits retain their granting port for renewal and release", () => {
+  assert.match(source, /activePermit: \{ permitId: string; port: number;/);
+  assert.match(source, /activePermit = \{ permitId, port \};/);
+  assert.match(source, /startPermitRenewal\(permitId, Number\(res\.permitTtlMs \|\| 0\), port\)/);
+  assert.match(source, /postJson\(port, "\/renew", \{ permitId \}, 5000\)/);
+  assert.match(source, /postJson\(p\.port, throttle \? "\/throttle" : "\/release"/);
 });
 
 test("permit acquisition remains pending instead of returning control to the provider", async () => {
