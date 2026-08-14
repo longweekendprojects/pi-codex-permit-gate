@@ -42,14 +42,18 @@ const DEFAULT_PROVIDER_PORTS = new Map<string, number>([
 
 // An explicit map replaces the defaults. This lets users opt into only the
 // accounts they have configured while keeping each account's queue independent.
+// A malformed explicit map disables every pool rather than falling back to an
+// unsafe partial configuration for a configured Codex account.
 export function parseProviderPorts(value: string | undefined): Map<string, number> {
   if (value === undefined) return new Map(DEFAULT_PROVIDER_PORTS);
+  if (!value.trim()) return new Map();
   const ports = new Map<string, number>();
   for (const entry of value.split(",")) {
     const match = entry.trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]*):(\d+)$/);
-    if (!match) continue;
+    if (!match) return new Map();
     const port = Number(match[2]);
-    if (Number.isInteger(port) && port >= 1 && port <= 65535) ports.set(match[1], port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return new Map();
+    ports.set(match[1], port);
   }
   return ports;
 }
@@ -72,7 +76,7 @@ const ACQUIRE_RETRY_MS = positiveEnvInt("CODEX_PERMIT_GATE_ACQUIRE_RETRY_MS", 50
 const INHERITED_GROUP = process.env[GROUP_ENV];
 const IS_SUBAGENT_CHILD = process.env.PI_SUBAGENT_CHILD === "1";
 
-let activePermit: { permitId: string; port: number; renewTimer?: ReturnType<typeof setInterval> } | undefined;
+let activePermit: Permit | undefined;
 let sessionId = "unknown";
 let group = "unknown";
 
@@ -85,16 +89,16 @@ let group = "unknown";
 // spawning root, so process lineage is preserved; a top-level session that runs
 // /new, /resume, or /fork becomes its own root, so replacing a session cannot
 // keep charging its work to a group the operator has moved on from.
-function resolveGroup(ctx: any): string {
+export function resolveGroup(ctx: any, inheritedGroup = INHERITED_GROUP, isSubagentChild = IS_SUBAGENT_CHILD): string {
   const own = ctx.sessionManager.getSessionId();
-  if (IS_SUBAGENT_CHILD && INHERITED_GROUP) return INHERITED_GROUP;
+  if (isSubagentChild && inheritedGroup) return inheritedGroup;
   return own;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function providerPort(provider?: string): number | undefined {
-  return provider ? PROVIDER_PORTS.get(provider) : undefined;
+export function providerPort(provider: string | undefined, ports = PROVIDER_PORTS): number | undefined {
+  return provider ? ports.get(provider) : undefined;
 }
 
 function providerLabel(provider: string): string {
@@ -160,6 +164,8 @@ async function ensureDaemon(dir: string, port: number): Promise<void> {
   child.unref();
 }
 
+type Permit = { permitId: string; port: number; renewTimer?: ReturnType<typeof setInterval> };
+type PermitPost = (port: number, pathName: string, body: any, timeoutMs: number) => Promise<any>;
 type AcquireOptions = {
   warningAfterAttempts?: number;
   retryMs?: number;
@@ -167,6 +173,7 @@ type AcquireOptions = {
   ensure?: (dir: string) => Promise<void>;
   wait?: (ms: number, signal?: AbortSignal) => Promise<unknown>;
   onUnavailable?: (message: string) => void;
+  release?: (port: number, permitId: string) => Promise<unknown>;
   port?: number;
   signal?: AbortSignal;
 };
@@ -179,6 +186,7 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   const port = options.port ?? 0;
   const request = options.request ?? ((pathName, payload, requestSignal) => postJson(port, pathName, payload, 7200000, requestSignal));
   const ensure = options.ensure ?? ((daemonDir) => ensureDaemon(daemonDir, port));
+  const release = options.release ?? ((releasePort, permitId) => postJson(releasePort, "/release", { permitId }, 5000));
   const wait = options.wait ?? waitForRetry;
   let warned = false;
 
@@ -194,7 +202,7 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
     }
     if (res?.permitId) {
       if (isAborted(signal)) {
-        await postJson(port, "/release", { permitId: res.permitId }, 5000).catch(() => {});
+        await release(port, res.permitId).catch(() => {});
         throw abortError();
       }
       return res;
@@ -211,15 +219,20 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   }
 }
 
+export async function renewPermit(permit: Permit, post: PermitPost = postJson): Promise<void> {
+  try { await post(permit.port, "/renew", { permitId: permit.permitId }, 5000); } catch {
+    // A daemon restart loses lease state. The provider request already owns
+    // its permit, so release/error handling remains best-effort as before.
+  }
+}
+
 function startPermitRenewal(permitId: string, permitTtlMs: number, port: number): ReturnType<typeof setInterval> | undefined {
   if (!Number.isFinite(permitTtlMs) || permitTtlMs <= 0) return undefined;
   const renewEveryMs = Math.max(10, Math.min(60000, Math.floor(permitTtlMs / 3)));
-  const timer = setInterval(async () => {
-    if (activePermit?.permitId !== permitId || activePermit.port !== port) return;
-    try { await postJson(port, "/renew", { permitId }, 5000); } catch {
-      // A daemon restart loses lease state. The provider request already owns
-      // its permit, so release/error handling remains best-effort as before.
-    }
+  const timer = setInterval(() => {
+    const permit = activePermit;
+    if (!permit || permit.permitId !== permitId || permit.port !== port) return;
+    void renewPermit(permit);
   }, renewEveryMs);
   timer.unref?.();
   return timer;
@@ -255,16 +268,20 @@ async function acquirePermit(ctx: any, dir: string, provider: string, port: numb
   }
 }
 
-async function releasePermit(throttle: boolean, reason: string, cooldownMs?: number): Promise<void> {
-  const p = activePermit;
-  if (!p) return;
-  activePermit = undefined;
-  if (p.renewTimer) clearInterval(p.renewTimer);
+export async function releaseGrantedPermit(permit: Permit, throttle: boolean, reason: string, cooldownMs: number | undefined, post: PermitPost = postJson): Promise<void> {
   try {
-    await postJson(p.port, throttle ? "/throttle" : "/release", { permitId: p.permitId, reason, cooldownMs }, 5000);
+    await post(permit.port, throttle ? "/throttle" : "/release", { permitId: permit.permitId, reason, cooldownMs }, 5000);
   } catch {
     // The daemon may have restarted; do not block the session on release cleanup.
   }
+}
+
+async function releasePermit(throttle: boolean, reason: string, cooldownMs?: number): Promise<void> {
+  const permit = activePermit;
+  if (!permit) return;
+  activePermit = undefined;
+  if (permit.renewTimer) clearInterval(permit.renewTimer);
+  await releaseGrantedPermit(permit, throttle, reason, cooldownMs);
 }
 
 type ProviderFailure = "rate-limit" | "overloaded";

@@ -1,60 +1,91 @@
 import assert from "node:assert/strict";
-import fs from "node:fs/promises";
-import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
-import { acquirePermitResponse, parseProviderPorts } from "../index.ts";
-
-const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const source = await fs.readFile(path.join(root, "index.ts"), "utf8");
-
-function loadResolveGroup(isSubagentChild, inheritedGroup) {
-  const match = source.match(/function resolveGroup\(ctx: any\): string \{([\s\S]*?)\n\}/);
-  assert(match, "resolveGroup implementation was not found");
-  return (ctx) => Function(
-    "IS_SUBAGENT_CHILD",
-    "INHERITED_GROUP",
-    "ctx",
-    match[1],
-  )(isSubagentChild, inheritedGroup, ctx);
-}
+import permitGate, {
+  acquirePermitResponse,
+  parseProviderPorts,
+  providerPort,
+  releaseGrantedPermit,
+  renewPermit,
+  resolveGroup,
+} from "../index.ts";
 
 function context(sessionId) {
   return { sessionManager: { getSessionId: () => sessionId } };
 }
 
 test("only recognized subagent children inherit an orchestration group", () => {
-  assert.equal(loadResolveGroup(true, "parent-root")(context("child-leaf")), "parent-root");
-  assert.equal(loadResolveGroup(false, "stale-root")(context("top-level")), "top-level");
-  assert.equal(loadResolveGroup(true, "")(context("child-without-root")), "child-without-root");
+  assert.equal(resolveGroup(context("child-leaf"), "parent-root", true), "parent-root");
+  assert.equal(resolveGroup(context("top-level"), "stale-root", false), "top-level");
+  assert.equal(resolveGroup(context("child-without-root"), "", true), "child-without-root");
 });
 
-test("unmapped parents export their group before the provider pool guard", () => {
-  const exportPosition = source.indexOf("process.env[GROUP_ENV] = group;");
-  const providerGuardPosition = source.indexOf("const port = providerPort(ctx.model?.provider);");
-  assert(exportPosition >= 0, "group export is missing");
-  assert(providerGuardPosition >= 0, "provider pool guard is missing");
-  assert(exportPosition < providerGuardPosition, "provider pool guard prevents parent group export");
+test("unmapped parents export their group", async () => {
+  const handlers = new Map();
+  await permitGate({
+    on(name, handler) { handlers.set(name, handler); },
+    registerCommand() {},
+  });
+  const previousGroup = process.env.CODEX_PERMIT_GATE_GROUP;
+  try {
+    await handlers.get("session_start")({}, {
+      ...context("local-root"),
+      model: { provider: "local-model" },
+      hasUI: false,
+    });
+    assert.equal(process.env.CODEX_PERMIT_GATE_GROUP, resolveGroup(context("local-root")));
+  } finally {
+    if (previousGroup === undefined) delete process.env.CODEX_PERMIT_GATE_GROUP;
+    else process.env.CODEX_PERMIT_GATE_GROUP = previousGroup;
+  }
 });
 
-test("provider-port mapping uses defaults only when unset and ignores invalid explicit entries", () => {
+test("provider-port mapping uses defaults only when unset and fails closed for malformed explicit maps", () => {
   assert.deepEqual([...parseProviderPorts(undefined)], [
     ["openai-codex", 8795],
     ["openai-codex-a", 8796],
     ["openai-codex-b", 8797],
   ]);
-  assert.deepEqual([...parseProviderPorts("openai-codex-a:9001, invalid, openai-codex-b:0, custom.pool:65535, :9002")], [
+  const explicitPorts = parseProviderPorts("openai-codex-a:9001,custom.pool:65535");
+  assert.deepEqual([...explicitPorts], [
     ["openai-codex-a", 9001],
     ["custom.pool", 65535],
   ]);
+  assert.equal(providerPort("openai-codex", explicitPorts), undefined);
+  assert.equal(providerPort("openai-codex-b", explicitPorts), undefined);
+  assert.deepEqual([...parseProviderPorts("")], []);
+
+  for (const value of ["openai-codex:9000, invalid", "openai-codex-a:0,custom.pool:65535", "openai-codex-b:65536"]) {
+    const ports = parseProviderPorts(value);
+    assert.deepEqual([...ports], [], `${value} must not retain a partial map`);
+    for (const provider of ["openai-codex", "openai-codex-a", "openai-codex-b"]) {
+      assert.equal(providerPort(provider, ports), undefined, `${value} must block ${provider}`);
+    }
+  }
 });
 
-test("active permits retain their granting port for renewal and release", () => {
-  assert.match(source, /activePermit: \{ permitId: string; port: number;/);
-  assert.match(source, /activePermit = \{ permitId, port \};/);
-  assert.match(source, /startPermitRenewal\(permitId, Number\(res\.permitTtlMs \|\| 0\), port\)/);
-  assert.match(source, /postJson\(port, "\/renew", \{ permitId \}, 5000\)/);
-  assert.match(source, /postJson\(p\.port, throttle \? "\/throttle" : "\/release"/);
+test("granted permits keep their original port for renewal, release, throttling, and abort cleanup", async () => {
+  const calls = [];
+  const post = async (port, pathName, body, timeoutMs) => { calls.push({ port, pathName, body, timeoutMs }); };
+  const permit = { permitId: "granted-on-b", port: 8797 };
+
+  await renewPermit(permit, post);
+  await releaseGrantedPermit(permit, false, "assistant-end", undefined, post);
+  await releaseGrantedPermit(permit, true, "assistant-rate-limit", 1000, post);
+
+  const controller = new AbortController();
+  await assert.rejects(acquirePermitResponse({}, "/unused", {
+    port: permit.port,
+    signal: controller.signal,
+    request: async () => { controller.abort(); return { permitId: "aborted-after-grant" }; },
+    release: async (port, permitId) => { calls.push({ port, pathName: "/release", body: { permitId }, timeoutMs: 5000 }); },
+  }), { name: "AbortError" });
+
+  assert.deepEqual(calls, [
+    { port: 8797, pathName: "/renew", body: { permitId: "granted-on-b" }, timeoutMs: 5000 },
+    { port: 8797, pathName: "/release", body: { permitId: "granted-on-b", reason: "assistant-end", cooldownMs: undefined }, timeoutMs: 5000 },
+    { port: 8797, pathName: "/throttle", body: { permitId: "granted-on-b", reason: "assistant-rate-limit", cooldownMs: 1000 }, timeoutMs: 5000 },
+    { port: 8797, pathName: "/release", body: { permitId: "aborted-after-grant" }, timeoutMs: 5000 },
+  ]);
 });
 
 test("permit acquisition remains pending instead of returning control to the provider", async () => {
