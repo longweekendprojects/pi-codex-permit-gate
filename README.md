@@ -51,7 +51,7 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `CODEX_PERMIT_GATE_DISABLE` | `0` | Set to `1` to bypass the extension for a Pi process. |
-| `CODEX_PERMIT_GATE_PROVIDER_PORTS` | `openai-codex:8795,openai-codex-a:8796,openai-codex-b:8797` | Complete comma-separated provider-to-port map. An explicit map replaces these defaults; invalid entries are ignored. |
+| `CODEX_PERMIT_GATE_PROVIDER_PORTS` | `openai-codex:8795,openai-codex-a:8796,openai-codex-b:8797` | Complete comma-separated provider-to-port map. An explicit valid map replaces these defaults, including an empty map. |
 | `CODEX_PERMIT_GATE_MIN` | `2` | Throughput floor for isolated failures. Sustained failure overrides it. |
 | `CODEX_PERMIT_GATE_ABSOLUTE_MIN` | `1` | Floor during an incident. Never above `MIN`. |
 | `CODEX_PERMIT_GATE_INCIDENT_THRESHOLD` | `3` | Failures inside one window that mark the provider degraded. |
@@ -69,6 +69,8 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | `CODEX_PERMIT_GATE_ACQUIRE_RETRY_MS` | `500` | Delay between unsuccessful permit attempts. |
 | `CODEX_PERMIT_GATE_VERBOSE` | `0` | Set to `1` for permit-grant notifications. |
 
+Each entry must be `provider:port`, with a port from 1 through 65535. A malformed explicit map blocks the three built-in Codex providers and any provider name present in that map instead of using a partial map. Fix `CODEX_PERMIT_GATE_PROVIDER_PORTS` and restart Pi, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to bypass the gate. Set the variable to an empty string to intentionally bypass every provider.
+
 After changing daemon settings, stop the existing daemon gracefully; the next Codex request restarts it:
 
 ```bash
@@ -85,7 +87,7 @@ The daemon listens only on `127.0.0.1`. Its state and log live under `~/.pi/agen
 
 ## Limitations and security
 
-- The gate covers only providers listed in `CODEX_PERMIT_GATE_PROVIDER_PORTS`; the default map includes `openai-codex`, `openai-codex-a`, and `openai-codex-b`.
+- The gate covers only providers listed in a valid `CODEX_PERMIT_GATE_PROVIDER_PORTS` map; the default map includes `openai-codex`, `openai-codex-a`, and `openai-codex-b`. A malformed explicit map blocks these built-in providers and provider names it contains until the map is fixed or the gate is disabled.
 - Throughput is bounded by concurrency times service time. Sustained demand above that rate still queues, and long requests still make other sessions wait.
 - Daemon settings are read once, when the daemon starts. Because any session can restart a stopped daemon, per-shell environment overrides are unreliable; change the defaults or set the variables for every session that might spawn it.
 - The localhost control plane is unauthenticated. Any process running as the local user can acquire or renew permits, request cooldowns, or occupy the configured port. Renewable leases bound abandoned permits, but they do not defend against a malicious local process.

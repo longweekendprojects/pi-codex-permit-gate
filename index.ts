@@ -39,26 +39,47 @@ const DEFAULT_PROVIDER_PORTS = new Map<string, number>([
   ["openai-codex-a", 8796],
   ["openai-codex-b", 8797],
 ]);
+const BUILT_IN_CODEX_PROVIDERS = new Set(DEFAULT_PROVIDER_PORTS.keys());
 
-// An explicit map replaces the defaults. This lets users opt into only the
-// accounts they have configured while keeping each account's queue independent.
-// A malformed explicit map disables every pool rather than falling back to an
-// unsafe partial configuration for a configured Codex account.
-export function parseProviderPorts(value: string | undefined): Map<string, number> {
-  if (value === undefined) return new Map(DEFAULT_PROVIDER_PORTS);
-  if (!value.trim()) return new Map();
-  const ports = new Map<string, number>();
+export type ProviderPortConfig =
+  | { kind: "valid"; ports: Map<string, number> }
+  | { kind: "invalid"; blockedProviders: Set<string>; reason: string };
+export type GateDecision =
+  | { kind: "gate"; port: number }
+  | { kind: "bypass" }
+  | { kind: "block"; reason: string };
+
+// An explicit map replaces the defaults. A malformed map does not fall back to
+// a partial configuration: built-in Codex providers and names in that value
+// remain blocked until the configuration is fixed or the gate is disabled.
+function providersNamedIn(value: string): Set<string> {
+  const providers = new Set(BUILT_IN_CODEX_PROVIDERS);
   for (const entry of value.split(",")) {
-    const match = entry.trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]*):(\d+)$/);
-    if (!match) return new Map();
-    const port = Number(match[2]);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) return new Map();
-    ports.set(match[1], port);
+    const provider = entry.trim().match(/^([A-Za-z0-9][A-Za-z0-9._-]*)/)?.[1];
+    if (provider) providers.add(provider);
   }
-  return ports;
+  return providers;
 }
 
-const PROVIDER_PORTS = parseProviderPorts(process.env.CODEX_PERMIT_GATE_PROVIDER_PORTS);
+export function parseProviderPorts(value: string | undefined): ProviderPortConfig {
+  if (value === undefined) return { kind: "valid", ports: new Map(DEFAULT_PROVIDER_PORTS) };
+  if (!value.trim()) return { kind: "valid", ports: new Map() };
+  const ports = new Map<string, number>();
+  const namedProviders = providersNamedIn(value);
+  for (const entry of value.split(",")) {
+    const trimmed = entry.trim();
+    const match = trimmed.match(/^([A-Za-z0-9][A-Za-z0-9._-]*):(\d+)$/);
+    if (!match) return { kind: "invalid", blockedProviders: namedProviders, reason: `Invalid CODEX_PERMIT_GATE_PROVIDER_PORTS entry: ${trimmed || "(empty entry)"}` };
+    const port = Number(match[2]);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return { kind: "invalid", blockedProviders: namedProviders, reason: `Invalid CODEX_PERMIT_GATE_PROVIDER_PORTS port for ${match[1]}` };
+    }
+    ports.set(match[1], port);
+  }
+  return { kind: "valid", ports };
+}
+
+const PROVIDER_PORT_CONFIG = parseProviderPorts(process.env.CODEX_PERMIT_GATE_PROVIDER_PORTS);
 const VERBOSE = process.env.CODEX_PERMIT_GATE_VERBOSE === "1";
 const GROUP_ENV = "CODEX_PERMIT_GATE_GROUP";
 function positiveEnvInt(name: string, fallback: number, minimum: number): number {
@@ -97,8 +118,46 @@ export function resolveGroup(ctx: any, inheritedGroup = INHERITED_GROUP, isSubag
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function providerPort(provider: string | undefined, ports = PROVIDER_PORTS): number | undefined {
-  return provider ? ports.get(provider) : undefined;
+export function gateDecision(provider: string | undefined, config = PROVIDER_PORT_CONFIG): GateDecision {
+  if (!provider) return { kind: "bypass" };
+  if (config.kind === "valid") {
+    const port = config.ports.get(provider);
+    return port ? { kind: "gate", port } : { kind: "bypass" };
+  }
+  return config.blockedProviders.has(provider) ? { kind: "block", reason: config.reason } : { kind: "bypass" };
+}
+
+function invalidConfigStatus(provider: string): string {
+  return `${providerLabel(provider)} gate: blocked; invalid CODEX_PERMIT_GATE_PROVIDER_PORTS`;
+}
+
+function invalidConfigRecovery(reason: string): string {
+  return `${reason}. Fix CODEX_PERMIT_GATE_PROVIDER_PORTS and restart Pi, or restart Pi with CODEX_PERMIT_GATE_DISABLE=1 to bypass the gate.`;
+}
+
+function setGateStatus(ctx: any, provider: string | undefined, decision: GateDecision): void {
+  if (!ctx.hasUI) return;
+  if (decision.kind === "gate") ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider!)} gate: ready`);
+  else if (decision.kind === "block") ctx.ui.setStatus("codex-permit-gate", invalidConfigStatus(provider!));
+  else ctx.ui.setStatus("codex-permit-gate", undefined);
+}
+
+let invalidConfigReported = false;
+function waitForAbort(signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (isAborted(signal)) { resolve(); return; }
+    signal?.addEventListener("abort", resolve, { once: true });
+  });
+}
+
+async function blockProviderRequest(ctx: any, provider: string, reason: string): Promise<void> {
+  try { ctx.ui?.setStatus?.("codex-permit-gate", invalidConfigStatus(provider)); } catch {}
+  if (!invalidConfigReported) {
+    invalidConfigReported = true;
+    try { ctx.ui?.notify?.(invalidConfigRecovery(reason), "error"); } catch {}
+  }
+  await waitForAbort(ctx.signal);
+  try { ctx.ui?.setStatus?.("codex-permit-gate", undefined); } catch {}
 }
 
 function providerLabel(provider: string): string {
@@ -338,25 +397,28 @@ export default async function (pi: ExtensionAPI) {
     // Export unconditionally, before any provider check: a Claude or local-model
     // parent still has to hand its group to Codex children it spawns.
     process.env[GROUP_ENV] = group;
-    const port = providerPort(ctx.model?.provider);
-    if (!port) return;
-    await ensureDaemon(dir, port);
-    if (ctx.hasUI) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(ctx.model.provider)} gate: ready`);
+    const provider = ctx.model?.provider;
+    const decision = gateDecision(provider);
+    if (decision.kind === "gate") await ensureDaemon(dir, decision.port);
+    setGateStatus(ctx, provider, decision);
   });
 
   pi.on("model_select", async (event: any, ctx: any) => {
     if (!ctx.hasUI) return;
     const provider = event.model?.provider;
-    if (providerPort(provider)) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider)} gate: ready`);
-    else ctx.ui.setStatus("codex-permit-gate", undefined);
+    setGateStatus(ctx, provider, gateDecision(provider));
   });
 
   pi.on("before_provider_request", async (_event, ctx) => {
     const provider = ctx.model?.provider;
-    const port = providerPort(provider);
-    if (!provider || !port) return undefined;
-    await ensureDaemon(dir, port);
-    await acquirePermit(ctx, dir, provider, port);
+    const decision = gateDecision(provider);
+    if (!provider || decision.kind === "bypass") return undefined;
+    if (decision.kind === "block") {
+      await blockProviderRequest(ctx, provider, decision.reason);
+      return undefined;
+    }
+    await ensureDaemon(dir, decision.port);
+    await acquirePermit(ctx, dir, provider, decision.port);
     return undefined;
   });
 
@@ -365,7 +427,7 @@ export default async function (pi: ExtensionAPI) {
     const failure = classifyProviderFailure(event.message);
     await releasePermit(!!failure, failure ? `assistant-${failure}` : "assistant-end", failure ? cooldownForFailure(failure) : undefined);
     const provider = ctx.model?.provider;
-    if (ctx.hasUI && providerPort(provider)) ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider)} gate: ready`);
+    setGateStatus(ctx, provider, gateDecision(provider));
     return undefined;
   });
 
@@ -375,8 +437,12 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("codex-permit", {
     description: "Show the Codex permit gate status: /codex-permit",
     handler: async (_args, ctx) => {
+      if (PROVIDER_PORT_CONFIG.kind === "invalid") {
+        ctx.ui.notify(`Codex permit gate configuration is invalid. ${invalidConfigRecovery(PROVIDER_PORT_CONFIG.reason)}`, "error");
+        return;
+      }
       const poolLines = (await Promise.all(
-        [...PROVIDER_PORTS].map(async ([provider, port]) => formatPoolStatus(provider, port, await getJson(port, "/health"))),
+        [...PROVIDER_PORT_CONFIG.ports].map(async ([provider, port]) => formatPoolStatus(provider, port, await getJson(port, "/health"))),
       )).flat();
       ctx.ui.notify(
         poolLines.length ? ["Codex permit pools:", ...poolLines].join("\n") : "Codex permit gate: no provider pools are configured.",
