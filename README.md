@@ -2,7 +2,7 @@
 
 A shared, fair concurrency gate for native OpenAI Codex requests in [Pi](https://github.com/badlogic/pi-mono).
 
-When several Pi sessions call Codex at once, provider overloads can increase and a session with many subagents can crowd out other work. This extension gives each mapped Codex account its own local permit queue. It sends one request at a time by default and gives each top-level Pi session an equal turn, including all of its subagents.
+When several Pi sessions call Codex at once, provider overloads can increase and a session with many subagents can crowd out other work. This extension gives each mapped Codex account its own local permit queue. Each queue starts with three requests in flight and gives every top-level Pi session an equal turn, including all of its subagents.
 
 ## Install
 
@@ -62,7 +62,7 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | `CODEX_PERMIT_GATE_START` | `3` | Initial concurrency, bounded by min and max. |
 | `CODEX_PERMIT_GATE_OVERLOADED_COOLDOWN_MS` | `8000` | Cooldown requested after an overload response. |
 | `CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS` | `10000` | Cooldown requested after a rate-limit response. |
-| `CODEX_PERMIT_GATE_MAX_COOLDOWN_MS` | `15000` | Hard ceiling for any cooldown. A cooldown pauses every lane. |
+| `CODEX_PERMIT_GATE_MAX_COOLDOWN_MS` | `15000` | Hard ceiling for any cooldown. A cooldown pauses every scheduling group in that provider pool. |
 | `CODEX_PERMIT_GATE_INCREASE_AFTER_MS` | `60000` | Clean window before stepping concurrency back up toward the ceiling. |
 | `CODEX_PERMIT_GATE_PERMIT_TTL_MS` | `300000` | Time without a lease renewal before an abandoned permit is reclaimed. Set to `0` to disable. |
 | `CODEX_PERMIT_GATE_ACQUIRE_WARNING_ATTEMPTS` | `600` | Unsuccessful attempts before reporting prolonged gate unavailability. The request remains blocked and retries continue. |
