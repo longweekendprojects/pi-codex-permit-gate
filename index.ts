@@ -286,6 +286,30 @@ function cooldownForFailure(failure: ProviderFailure): number {
   return Number(process.env.CODEX_PERMIT_GATE_RATE_LIMIT_COOLDOWN_MS || 10 * 1000);
 }
 
+// One pool's slice of /codex-permit output, so the command body stays a plain
+// read of every mapped account.
+function formatPoolStatus(provider: string, port: number, health: any): string[] {
+  const header = `${provider} (127.0.0.1:${port}):`;
+  if (!health?.ok) return [`${header} daemon stopped (starts on the next ${provider} request).`];
+  const groupLines = (Object.entries(health.groups || {}) as [string, any][])
+    .sort((a, b) => Number(b[1].queued || 0) - Number(a[1].queued || 0))
+    .map(([id, g]) => {
+      const mark = id === group ? "*" : " ";
+      const wait = Math.round(Number(g.oldestWaitMs || 0) / 1000);
+      const sessions = Number(g.sessions?.length || 0);
+      return `    ${mark} ${id}: active ${g.active}, queued ${g.queued}${sessions > 1 ? ` (${sessions} sessions)` : ""}, granted ${g.granted}, oldest wait ${wait}s`;
+    });
+  return [
+    header,
+    `  concurrency ${health.current}/${health.max}, active ${health.active}, queued ${health.queued}`,
+    `  cooldown remaining ${Math.round(Number(health.cooldownMsRemaining || 0) / 1000)}s`,
+    `  granted ${health.granted}, released ${health.released}, throttles ${health.throttles}, expired ${health.expired}`,
+    `  peak active ${health.peakActive}, peak queued ${health.peakQueued}, peak wait ${Math.round(Number(health.peakOldestWaitMs || 0) / 1000)}s`,
+    groupLines.length ? "  Groups (one per top-level session; * = this session):" : "  Groups: none active",
+    ...groupLines,
+  ];
+}
+
 export default async function (pi: ExtensionAPI) {
   if (DISABLED) return;
 
@@ -311,11 +335,11 @@ export default async function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_request", async (_event, ctx) => {
-    const model = ctx.model;
-    const port = providerPort(model?.provider);
-    if (!model || !port) return undefined;
+    const provider = ctx.model?.provider;
+    const port = providerPort(provider);
+    if (!provider || !port) return undefined;
     await ensureDaemon(dir, port);
-    await acquirePermit(ctx, dir, model.provider, port);
+    await acquirePermit(ctx, dir, provider, port);
     return undefined;
   });
 
@@ -334,29 +358,9 @@ export default async function (pi: ExtensionAPI) {
   pi.registerCommand("codex-permit", {
     description: "Show the Codex permit gate status: /codex-permit",
     handler: async (_args, ctx) => {
-      const pools = await Promise.all([...PROVIDER_PORTS].map(async ([provider, port]) => ({ provider, port, health: await getJson(port, "/health") })));
-      const poolLines = pools.flatMap(({ provider, port, health: h }) => {
-        const header = `${provider} (127.0.0.1:${port}):`;
-        if (!h?.ok) return [`${header} daemon stopped (starts on the next ${provider} request).`];
-        const groups = Object.entries(h.groups || {}) as [string, any][];
-        const groupLines = groups
-          .sort((a, b) => Number(b[1].queued || 0) - Number(a[1].queued || 0))
-          .map(([id, g]) => {
-            const mark = id === group ? "*" : " ";
-            const wait = Math.round(Number(g.oldestWaitMs || 0) / 1000);
-            const sessions = Number(g.sessions?.length || 0);
-            return `    ${mark} ${id}: active ${g.active}, queued ${g.queued}${sessions > 1 ? ` (${sessions} sessions)` : ""}, granted ${g.granted}, oldest wait ${wait}s`;
-          });
-        return [
-          header,
-          `  concurrency ${h.current}/${h.max}, active ${h.active}, queued ${h.queued}`,
-          `  cooldown remaining ${Math.round(Number(h.cooldownMsRemaining || 0) / 1000)}s`,
-          `  granted ${h.granted}, released ${h.released}, throttles ${h.throttles}, expired ${h.expired}`,
-          `  peak active ${h.peakActive}, peak queued ${h.peakQueued}, peak wait ${Math.round(Number(h.peakOldestWaitMs || 0) / 1000)}s`,
-          groupLines.length ? "  Groups (one per top-level session; * = this session):" : "  Groups: none active",
-          ...groupLines,
-        ];
-      });
+      const poolLines = (await Promise.all(
+        [...PROVIDER_PORTS].map(async ([provider, port]) => formatPoolStatus(provider, port, await getJson(port, "/health"))),
+      )).flat();
       ctx.ui.notify(
         poolLines.length ? ["Codex permit pools:", ...poolLines].join("\n") : "Codex permit gate: no provider pools are configured.",
         "info",
