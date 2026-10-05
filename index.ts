@@ -137,8 +137,8 @@ function invalidConfigRecovery(reason: string): string {
 
 function setGateStatus(ctx: any, provider: string | undefined, decision: GateDecision): void {
   if (!ctx.hasUI) return;
-  if (decision.kind === "gate") ctx.ui.setStatus("codex-permit-gate", `${providerLabel(provider!)} gate: ready`);
-  else if (decision.kind === "block") ctx.ui.setStatus("codex-permit-gate", invalidConfigStatus(provider!));
+  // A ready gate stays silent; the footer shows the gate only while it waits, holds a permit, or is blocked.
+  if (decision.kind === "block") ctx.ui.setStatus("codex-permit-gate", invalidConfigStatus(provider!));
   else ctx.ui.setStatus("codex-permit-gate", undefined);
 }
 
