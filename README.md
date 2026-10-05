@@ -9,7 +9,7 @@ When several Pi sessions call Codex at once, provider overloads can increase and
 Install the immutable release tag:
 
 ```bash
-pi install git:github.com/longweekendprojects/pi-codex-permit-gate@v0.1.0
+pi install git:github.com/longweekendprojects/pi-codex-permit-gate@v0.5.1
 ```
 
 Then start a new Pi session or run `/reload` in an existing one. Inspect the live gate with:
@@ -113,7 +113,7 @@ The daemon log is:
 Update by installing a newer immutable tag. Remove the package with:
 
 ```bash
-pi remove git:github.com/longweekendprojects/pi-codex-permit-gate@v0.1.0
+pi remove git:github.com/longweekendprojects/pi-codex-permit-gate@v0.5.1
 ```
 
 Then run `/reload` or restart Pi.
