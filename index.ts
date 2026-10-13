@@ -178,7 +178,7 @@ function getJson<T = any>(port: number, pathName = "/health", timeoutMs = 1000):
   });
 }
 
-function postJson<T = any>(port: number, pathName: string, body: any, timeoutMs = 7200000, signal?: AbortSignal): Promise<T> {
+export function postJson<T = any>(port: number, pathName: string, body: any, timeoutMs = 7200000, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(abortError()); return; }
     const payload = JSON.stringify(body || {});
@@ -194,10 +194,12 @@ function postJson<T = any>(port: number, pathName: string, body: any, timeoutMs 
         try { resolve(buf ? JSON.parse(buf) : {}); } catch (err) { reject(err); }
       });
     });
-    const abort = () => req.destroy(abortError());
+    // Attach the error listener first and reject before destroying, so a cancelled wait never
+    // surfaces as an uncaught exception that exits the agent process.
+    req.on("error", reject);
+    const abort = () => { reject(abortError()); req.destroy(); };
     signal?.addEventListener("abort", abort, { once: true });
     req.on("timeout", () => req.destroy(new Error("permit acquire timed out")));
-    req.on("error", reject);
     req.on("close", () => signal?.removeEventListener("abort", abort));
     req.end(payload);
   });
