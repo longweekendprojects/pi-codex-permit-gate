@@ -29,6 +29,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -213,9 +214,23 @@ function waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+// The daemon must run under Node. Inside a compiled host such as Pi-Bolt, process.execPath is the
+// agent binary itself: spawning it with the daemon path starts a new agent session, which loads this
+// gate and spawns again, without end. Use process.execPath only when it is Node, else Node from PATH.
+export function resolveNodeBinary(execPath = process.execPath, searchPath = process.env.PATH ?? ""): string {
+  const isNode = (file: string) => /^node(\.exe)?$/i.test(path.basename(file));
+  if (isNode(execPath)) return execPath;
+  for (const dir of searchPath.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, process.platform === "win32" ? "node.exe" : "node");
+    try { fs.accessSync(candidate, fs.constants.X_OK); if (fs.statSync(candidate).isFile()) return candidate; } catch {}
+  }
+  throw new Error(`cannot start the permit daemon: ${execPath} is not Node and no node binary is on PATH`);
+}
+
 async function ensureDaemon(dir: string, port: number): Promise<void> {
   if ((await getJson(port))?.ok) return;
-  const child = spawn(process.execPath, [path.join(dir, "permit-daemon.mjs")], {
+  const child = spawn(resolveNodeBinary(), [path.join(dir, "permit-daemon.mjs")], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, CODEX_PERMIT_GATE_PORT: String(port) },
