@@ -51,7 +51,7 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | Variable | Default | Purpose |
 | --- | ---: | --- |
 | `CODEX_PERMIT_GATE_DISABLE` | `0` | Set to `1` to bypass the extension for a Pi process. |
-| `CODEX_PERMIT_GATE_PROVIDER_PORTS` | `openai-codex:8795,openai-codex-a:8796,openai-codex-b:8797` | Complete comma-separated provider-to-port map. An explicit valid map replaces these defaults, including an empty map. |
+| `CODEX_PERMIT_GATE_PROVIDER_PORTS` | `openai-codex:8795,openai-codex-a:8796,openai-codex-b:8797` | A valid, nonempty comma-separated map replaces these defaults. |
 | `CODEX_PERMIT_GATE_MIN` | `2` | Throughput floor for isolated failures. Sustained failure overrides it. |
 | `CODEX_PERMIT_GATE_ABSOLUTE_MIN` | `1` | Floor during an incident. Never above `MIN`. |
 | `CODEX_PERMIT_GATE_INCIDENT_THRESHOLD` | `3` | Failures inside one window that mark the provider degraded. |
@@ -69,7 +69,9 @@ Environment variables are read when Pi loads the extension or when the daemon fi
 | `CODEX_PERMIT_GATE_ACQUIRE_RETRY_MS` | `500` | Delay between unsuccessful permit attempts. |
 | `CODEX_PERMIT_GATE_VERBOSE` | `0` | Set to `1` for permit-grant notifications. |
 
-Each entry must be `provider:port`, with a port from 1 through 65535. A malformed explicit map blocks the three built-in Codex providers and any provider name present in that map instead of using a partial map. Fix `CODEX_PERMIT_GATE_PROVIDER_PORTS` and restart Pi, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to bypass the gate. Set the variable to an empty string to intentionally bypass every provider.
+Each entry needs a unique provider name and a port from 1 through 65535. A malformed or empty override blocks built-in Codex providers and names in the override. The gate reports the bad entry instead of using part of the map.
+
+Fix or unset the override and restart Pi. To turn off the gate, restart Pi with `CODEX_PERMIT_GATE_DISABLE=1`.
 
 After changing daemon settings, stop the existing daemon gracefully; the next Codex request restarts it:
 

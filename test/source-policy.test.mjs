@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import http from "node:http";
+import { PassThrough, Readable } from "node:stream";
 import test from "node:test";
 import permitGate, {
   acquirePermitResponse,
@@ -80,10 +82,6 @@ test("provider-port configuration distinguishes defaults, valid omissions, and i
   assert.deepEqual(gateDecision("openai-codex-b", explicit), { kind: "bypass" });
   assert.deepEqual(gateDecision("openai-codex-a", explicit), { kind: "gate", port: 9001 });
 
-  const empty = parseProviderPorts("");
-  assert.equal(empty.kind, "valid");
-  assert.deepEqual([...empty.ports], []);
-
   for (const value of ["openai-codex:9000, invalid", "openai-codex-a:0,custom.pool:65535", "openai-codex-b:65536"]) {
     const config = parseProviderPorts(value);
     assert.equal(config.kind, "invalid", `${value} must not retain a partial map`);
@@ -109,6 +107,7 @@ test("malformed provider-port config blocks built-in Codex requests until abort"
     const pending = beforeProviderRequest({}, {
       model: { provider },
       signal: controller.signal,
+      hasUI: true,
       ui: {
         setStatus: (_name, status) => statuses.push(status),
         notify: (message, level) => errors.push({ message, level }),
@@ -130,16 +129,39 @@ test("malformed provider-port config blocks built-in Codex requests until abort"
   assert.match(errors[0].message, /Fix CODEX_PERMIT_GATE_PROVIDER_PORTS and restart Pi, or restart Pi with CODEX_PERMIT_GATE_DISABLE=1 to bypass the gate\./);
 });
 
-test("a valid empty provider-port map bypasses requests immediately", async () => {
-  const configuredGate = await loadConfiguredGate("");
-  const handlers = await hookHandlers(configuredGate.default);
-  const notices = [];
-  const result = await handlers.get("before_provider_request")({}, {
-    model: { provider: "openai-codex" },
-    ui: { notify: (...args) => notices.push(args) },
+test("empty and duplicate provider-port maps block dispatch and identify the bad entry", async (t) => {
+  const probe = t.mock.method(http, "get", (_url, _options, onResponse) => {
+    onResponse(Readable.from(['{"ok":true}']));
+    return new PassThrough();
   });
-  assert.equal(result, undefined);
-  assert.deepEqual(notices, []);
+  const post = t.mock.method(http, "request", () => { throw new Error("unexpected local permit POST"); });
+  for (const [value, badEntry] of [["", "empty entry"], ["openai-codex-a:9000,openai-codex-a:9001", "openai-codex-a:9001"]]) {
+    await t.test(value || "empty map", { timeout: 2_000 }, async () => {
+      const { default: configuredGate } = await loadConfiguredGate(value);
+      const handlers = await hookHandlers(configuredGate);
+      const controller = new AbortController();
+      const notices = [];
+      const dispatch = t.mock.fn();
+      const ctx = { model: { provider: "openai-codex-b" }, signal: controller.signal, hasUI: true, ui: { notify(message) { notices.push(message); } } };
+      const hostRun = (async () => {
+        try { await handlers.get("before_provider_request")({}, ctx); } catch {} // Pi logs and swallows hook exceptions.
+        if (!controller.signal.aborted) dispatch();
+      })();
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(dispatch.mock.callCount(), 0);
+        assert.equal(probe.mock.callCount(), 0);
+        assert.equal(post.mock.callCount(), 0);
+        assert.ok(notices[0]?.includes(badEntry), `expected a diagnostic naming ${badEntry}`);
+      } finally {
+        controller.abort();
+        await hostRun;
+        probe.mock.resetCalls();
+        post.mock.resetCalls();
+      }
+      assert.equal(dispatch.mock.callCount(), 0);
+    });
+  }
 });
 
 test("granted permits keep their original port for renewal, release, throttling, and abort cleanup", async () => {

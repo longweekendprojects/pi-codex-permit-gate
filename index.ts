@@ -27,7 +27,7 @@
 // Inspect the gate in-session:
 //   /codex-permit
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
@@ -65,16 +65,13 @@ function providersNamedIn(value: string): Set<string> {
 
 export function parseProviderPorts(value: string | undefined): ProviderPortConfig {
   if (value === undefined) return { kind: "valid", ports: new Map(DEFAULT_PROVIDER_PORTS) };
-  if (!value.trim()) return { kind: "valid", ports: new Map() };
   const ports = new Map<string, number>();
-  const namedProviders = providersNamedIn(value);
   for (const entry of value.split(",")) {
     const trimmed = entry.trim();
     const match = trimmed.match(/^([A-Za-z0-9][A-Za-z0-9._-]*):(\d+)$/);
-    if (!match) return { kind: "invalid", blockedProviders: namedProviders, reason: `Invalid CODEX_PERMIT_GATE_PROVIDER_PORTS entry: ${trimmed || "(empty entry)"}` };
-    const port = Number(match[2]);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      return { kind: "invalid", blockedProviders: namedProviders, reason: `Invalid CODEX_PERMIT_GATE_PROVIDER_PORTS port for ${match[1]}` };
+    const port = match ? Number(match[2]) : NaN;
+    if (!match || !Number.isInteger(port) || port < 1 || port > 65535 || ports.has(match[1])) {
+      return { kind: "invalid", blockedProviders: providersNamedIn(value), reason: `Invalid CODEX_PERMIT_GATE_PROVIDER_PORTS entry: ${trimmed ? JSON.stringify(trimmed) : "(empty entry)"}` };
     }
     ports.set(match[1], port);
   }
@@ -118,8 +115,6 @@ export function resolveGroup(ctx: any, inheritedGroup = INHERITED_GROUP, isSubag
   return own;
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 export function gateDecision(provider: string | undefined, config = PROVIDER_PORT_CONFIG): GateDecision {
   if (!provider) return { kind: "bypass" };
   if (config.kind === "valid") {
@@ -148,17 +143,20 @@ let invalidConfigReported = false;
 function waitForAbort(signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     if (isAborted(signal)) { resolve(); return; }
-    signal?.addEventListener("abort", resolve, { once: true });
+    signal?.addEventListener("abort", () => resolve(), { once: true });
   });
 }
 
-async function blockProviderRequest(ctx: any, provider: string, reason: string): Promise<void> {
-  try { ctx.ui?.setStatus?.("codex-permit-gate", invalidConfigStatus(provider)); } catch {}
+async function blockProviderRequest(ctx: ExtensionContext, provider: string, reason: string): Promise<void> {
+  try { ctx.ui.setStatus("codex-permit-gate", invalidConfigStatus(provider)); } catch {}
   if (!invalidConfigReported) {
     invalidConfigReported = true;
-    try { ctx.ui?.notify?.(invalidConfigRecovery(reason), "error"); } catch {}
+    const message = invalidConfigRecovery(reason);
+    try { if (ctx.hasUI) ctx.ui.notify(message, "error"); else process.stderr.write(`${message}\n`); } catch {}
   }
-  await waitForAbort(ctx.signal);
+  let signal: AbortSignal | undefined;
+  try { signal = ctx.signal; } catch {}
+  await waitForAbort(signal);
   try { ctx.ui?.setStatus?.("codex-permit-gate", undefined); } catch {}
 }
 
@@ -463,10 +461,7 @@ export default async function (pi: ExtensionAPI) {
       const poolLines = (await Promise.all(
         [...PROVIDER_PORT_CONFIG.ports].map(async ([provider, port]) => formatPoolStatus(provider, port, await getJson(port, "/health"))),
       )).flat();
-      ctx.ui.notify(
-        poolLines.length ? ["Codex permit pools:", ...poolLines].join("\n") : "Codex permit gate: no provider pools are configured.",
-        "info",
-      );
+      ctx.ui.notify(["Codex permit pools:", ...poolLines].join("\n"), "info");
     },
   });
 }
