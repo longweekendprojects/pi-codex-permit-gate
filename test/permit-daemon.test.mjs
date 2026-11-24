@@ -7,10 +7,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { acquirePermitResponse, releaseGrantedPermit } from "../index.ts";
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const daemonPath = path.join(root, "permit-daemon.mjs");
-const DEFAULT_PORT = 8795;
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -24,11 +24,11 @@ async function unusedPort() {
   assert(address && typeof address === "object");
   const port = address.port;
   await new Promise((resolve) => server.close(resolve));
-  assert.notEqual(port, DEFAULT_PORT, "tests must never use the live daemon port");
+  assert.ok(port < 8790 || port > 8797, "tests must not use a live daemon port");
   return port;
 }
 
-function request(port, method, pathname, payload) {
+function request(port, method, pathname, payload, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const body = payload === undefined ? undefined : JSON.stringify(payload);
     const req = http.request({
@@ -37,10 +37,10 @@ function request(port, method, pathname, payload) {
       method,
       path: pathname,
       timeout: 5000,
-      headers: body ? {
-        "content-type": "application/json",
-        "content-length": Buffer.byteLength(body),
-      } : undefined,
+      headers: {
+        ...(body ? { "content-type": "application/json", "content-length": Buffer.byteLength(body) } : {}),
+        ...extraHeaders,
+      },
     }, (res) => {
       let text = "";
       res.setEncoding("utf8");
@@ -90,12 +90,13 @@ async function startDaemon(overrides = {}) {
   const port = overrides.CODEX_PERMIT_GATE_PORT
     ? Number(overrides.CODEX_PERMIT_GATE_PORT)
     : await unusedPort();
-  assert.notEqual(port, DEFAULT_PORT, "tests must never use the live daemon port");
+  assert.ok(port < 8790 || port > 8797, "tests must not use a live daemon port");
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "pi-codex-permit-gate-test-"));
   const child = spawn(process.execPath, [daemonPath], {
     env: {
       ...process.env,
       HOME: home,
+      PI_CODING_AGENT_DIR: path.join(home, "agent"),
       CODEX_PERMIT_GATE_PORT: String(port),
       ...overrides,
     },
@@ -130,6 +131,74 @@ const SERIALIZED = {
   CODEX_PERMIT_GATE_MAX: "1",
   CODEX_PERMIT_GATE_START: "1",
 };
+
+test("local admission rejects unsafe headers even without the exact switch file", async (t) => {
+  const daemon = await startDaemon();
+  t.after(() => daemon.stop());
+  const dir = path.join(daemon.home, "agent", "codex-permit-gate");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(dir, "require-local-token.typo"), "", { mode: 0o600 });
+  const held = await acquire(daemon.port, "holder");
+  assert.equal(held.status, 200);
+  const payload = { permitId: held.body.permitId, reason: "fixture" };
+  for (const [name, headers, body, status] of [
+    ["foreign Host", { host: "other.example" }, payload, 400],
+    ["wrong Host port", { host: "127.0.0.1:1" }, payload, 400],
+    ["Origin", { origin: "https://site.example" }, payload, 403],
+    ["empty Origin", { origin: "" }, payload, 403],
+    ["non-JSON content type", { "content-type": "text/plain" }, payload, 415],
+    ["missing content type", {}, undefined, 415],
+  ]) {
+    await t.test(name, async () => {
+      const rejected = await request(daemon.port, "POST", "/throttle", body, headers);
+      const { active, queued, throttles, cooldownMsRemaining } = await getHealth(daemon.port);
+      assert.deepEqual({ status: rejected.status, active, queued, throttles, cooldownMsRemaining },
+        { status, active: 1, queued: 0, throttles: 0, cooldownMsRemaining: 0 });
+    });
+  }
+  await t.test("health still checks Host and Origin", async () => {
+    assert.equal((await request(daemon.port, "GET", "/health", undefined, { host: "other.example" })).status, 400);
+    assert.equal((await request(daemon.port, "GET", "/health", undefined, { origin: "null" })).status, 403);
+  });
+});
+
+test("local token enforcement stages old clients, admits updated clients, and rolls back live", async (t) => {
+  const daemon = await startDaemon();
+  t.after(() => daemon.stop());
+  const agent = path.join(daemon.home, "agent");
+  const dir = path.join(agent, "codex-permit-gate");
+  const switchFile = path.join(dir, "require-local-token.on");
+  const old = await acquire(daemon.port, "old-client");
+  assert.equal(old.status, 200);
+  assert.equal((await release(daemon.port, old.body.permitId)).body.ok, true);
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  await fs.writeFile(switchFile, "", { mode: 0o600 });
+  const denied = await acquire(daemon.port, "old-client");
+  assert.equal(denied.status, 401);
+  assert.equal((await request(daemon.port, "POST", "/acquire", { session: "wrong-token" }, { authorization: `Bearer ${"0".repeat(64)}` })).status, 401);
+  const state = await getHealth(daemon.port);
+  assert.deepEqual([state.ok, state.active, state.queued, state.granted], [true, 0, 0, 1]);
+  assert.equal((await fs.stat(path.join(dir, "local-token"))).mode & 0o777, 0o600);
+
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agent;
+  try {
+    const updated = await acquirePermitResponse({ session: "updated-client" }, root, {
+      port: daemon.port,
+      ensure: async () => {}, // Use only the scratch daemon started by this test.
+      wait: async () => assert.fail("updated client did not acquire with the token"),
+      signal: AbortSignal.timeout(2_000),
+    });
+    assert.ok(updated.permitId);
+    await releaseGrantedPermit({ port: daemon.port, permitId: updated.permitId }, false, "test");
+    assert.equal((await getHealth(daemon.port)).active, 0);
+    await fs.unlink(switchFile);
+    assert.equal((await acquire(daemon.port, "old-client")).status, 200);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+});
 
 test("shipped defaults keep several requests in flight and never serialize", async (t) => {
   const daemon = await startDaemon();
@@ -363,6 +432,7 @@ test("a second daemon on the same port exits cleanly without replacing the first
     env: {
       ...process.env,
       HOME: daemon.home,
+      PI_CODING_AGENT_DIR: path.join(daemon.home, "agent"),
       CODEX_PERMIT_GATE_PORT: String(daemon.port),
     },
     stdio: "ignore",

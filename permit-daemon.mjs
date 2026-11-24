@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import { LOCAL_HOST, localRequestGuard } from "./local-request-auth.mjs";
 
 const PORT = parseInt(process.env.CODEX_PERMIT_GATE_PORT || "8795", 10);
 // Concurrency is adaptive, not fixed. MIN is a throughput floor: a queue that
@@ -49,6 +50,7 @@ const INCREASE_AFTER_MS = Math.max(10000, parseInt(process.env.CODEX_PERMIT_GATE
 const PERMIT_TTL_MS = Math.max(0, parseInt(process.env.CODEX_PERMIT_GATE_PERMIT_TTL_MS || "300000", 10));
 const DIR = path.join(os.homedir(), ".pi", "agent", "codex-permit-gate");
 const LOG = path.join(DIR, "permit-daemon.log");
+const rejectLocalRequest = localRequestGuard();
 try { fs.mkdirSync(DIR, { recursive: true }); } catch {}
 
 const stats = {
@@ -249,6 +251,8 @@ function sweepStalePermits() {
 }
 
 const server = http.createServer(async (req, res) => {
+  const rejection = rejectLocalRequest(req);
+  if (rejection) return json(res, rejection.status, { ok: false, error: rejection.message });
   if (req.method === "GET" && req.url === "/health") {
     sweepStalePermits();
     const s = snapshot();
@@ -291,7 +295,7 @@ server.on("error", (err) => {
   log("server error", err.message);
   process.exit(1);
 });
-server.listen(PORT, "127.0.0.1", () => log(`permit daemon listening on 127.0.0.1:${PORT}; concurrency ${current}/${MAX}; cooldown<=${MAX_COOLDOWN_MS}ms; permitTtl ${PERMIT_TTL_MS}ms`));
+server.listen(PORT, LOCAL_HOST, () => log(`permit daemon listening on ${LOCAL_HOST}:${PORT}; concurrency ${current}/${MAX}; cooldown<=${MAX_COOLDOWN_MS}ms; permitTtl ${PERMIT_TTL_MS}ms`));
 const sweepTimer = setInterval(sweepStalePermits, 30000);
 if (sweepTimer.unref) sweepTimer.unref();
 function gracefulExit() {

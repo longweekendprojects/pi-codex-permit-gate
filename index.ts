@@ -33,6 +33,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { LOCAL_HOST, localAuthorization } from "./local-request-auth.mjs";
 
 const DISABLED = process.env.CODEX_PERMIT_GATE_DISABLE === "1";
 const DEFAULT_PROVIDER_PORTS = new Map<string, number>([
@@ -167,7 +168,7 @@ function providerLabel(provider: string): string {
 
 function getJson<T = any>(port: number, pathName = "/health", timeoutMs = 1000): Promise<T | undefined> {
   return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}${pathName}`, { timeout: timeoutMs }, (res) => {
+    const req = http.get(`http://${LOCAL_HOST}:${port}${pathName}`, { timeout: timeoutMs }, (res) => {
       let buf = "";
       res.setEncoding("utf8");
       res.on("data", (c) => { buf += c; });
@@ -182,10 +183,11 @@ export function postJson<T = any>(port: number, pathName: string, body: any, tim
   return new Promise((resolve, reject) => {
     if (signal?.aborted) { reject(abortError()); return; }
     const payload = JSON.stringify(body || {});
-    const req = http.request(`http://127.0.0.1:${port}${pathName}`, {
+    const authorization = localAuthorization();
+    const req = http.request(`http://${LOCAL_HOST}:${port}${pathName}`, {
       method: "POST",
       timeout: timeoutMs,
-      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload) },
+      headers: { "content-type": "application/json", "content-length": Buffer.byteLength(payload), ...(authorization ? { authorization } : {}) },
     }, (res) => {
       let buf = "";
       res.setEncoding("utf8");

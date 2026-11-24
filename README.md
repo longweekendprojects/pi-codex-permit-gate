@@ -90,7 +90,7 @@ The daemon listens only on `127.0.0.1`. Its state and log live under `~/.pi/agen
 - The gate covers only providers listed in a valid `CODEX_PERMIT_GATE_PROVIDER_PORTS` map; the default map includes `openai-codex`, `openai-codex-a`, and `openai-codex-b`. A malformed explicit map blocks these built-in providers and provider names it contains until the map is fixed or the gate is disabled.
 - Throughput is bounded by concurrency times service time. Sustained demand above that rate still queues, and long requests still make other sessions wait.
 - Daemon settings are read once, when the daemon starts. Because any session can restart a stopped daemon, per-shell environment overrides are unreliable; change the defaults or set the variables for every session that might spawn it.
-- The localhost control plane is unauthenticated. Any process running as the local user can acquire or renew permits, request cooldowns, or occupy the configured port. Renewable leases bound abandoned permits, but they do not defend against a malicious local process.
+- Until local token enforcement is enabled, local programs can still send control POSTs. The token does not protect against other programs running as the same user.
 - If the gate remains unavailable, the hook stays pending and continues retrying instead of bypassing the concurrency limit. Esc cancels its permit wait without bypassing the concurrency limit, so the gate no longer holds the turn hostage. Free the configured port, restore the daemon, or restart Pi with `CODEX_PERMIT_GATE_DISABLE=1` to recover.
 - With the WebSocket transport, pi-ai can reuse a warm cached socket and send `response.create` before checking the abort signal. A request cancelled during the permit wait may therefore still be sent once and immediately abandoned. Eliminating that residual race needs a Pi-side pre-transport abort guard.
 - The extension reduces overload pressure; it cannot prevent provider-side failures.
@@ -109,6 +109,18 @@ The daemon log is:
 ```text
 ~/.pi/agent/codex-permit-gate/permit-daemon.log
 ```
+
+### Local control authentication
+
+The daemon accepts only its own `127.0.0.1:<port>` Host and rejects any `Origin` header. Control POSTs require `Content-Type: application/json`.
+
+Local daemons share a mode-`0600` `local-token` file under `<agent dir>/codex-permit-gate/`. The agent directory is `PI_CODING_AGENT_DIR` when set, or `~/.pi/agent` by default.
+
+Leave `require-local-token.on` absent while replacing local daemons and reloading sessions. Confirm all local clients and daemons use the same agent directory and the token exists with mode `0600`.
+
+After the reloads, create an empty `require-local-token.on` beside `local-token` to require a token on control POSTs. Remove the switch file to restore old client access without removing the header checks. Neither action requires a restart.
+
+`GET /health` remains available without a token. An updated client reads the token before each control POST.
 
 Update by installing a newer immutable tag. Remove the package with:
 
