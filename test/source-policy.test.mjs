@@ -1,3 +1,4 @@
+import "./clean-permit-environment.mjs";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { PassThrough, Readable } from "node:stream";
@@ -55,7 +56,7 @@ test("unmapped parents export their group", async () => {
       model: { provider: "local-model" },
       hasUI: false,
     });
-    assert.equal(process.env.CODEX_PERMIT_GATE_GROUP, resolveGroup(context("local-root")));
+    assert.equal(process.env.CODEX_PERMIT_GATE_GROUP, "local-root");
   } finally {
     if (previousGroup === undefined) delete process.env.CODEX_PERMIT_GATE_GROUP;
     else process.env.CODEX_PERMIT_GATE_GROUP = previousGroup;
