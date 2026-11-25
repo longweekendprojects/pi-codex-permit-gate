@@ -64,6 +64,7 @@ const getHealth = (port) => request(port, "GET", "/health").then((response) => r
 const acquire = (port, group, session = group) => request(port, "POST", "/acquire", { group, session });
 const renew = (port, permitId) => request(port, "POST", "/renew", { permitId });
 const release = (port, permitId) => request(port, "POST", "/release", { permitId });
+const readDaemonLog = (home) => fs.readFile(path.join(home, ".pi", "agent", "codex-permit-gate", "permit-daemon.log"), "utf8");
 
 async function waitFor(check, message, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs;
@@ -161,6 +162,16 @@ test("local admission rejects unsafe headers even without the exact switch file"
     assert.equal((await request(daemon.port, "GET", "/health", undefined, { host: "other.example" })).status, 400);
     assert.equal((await request(daemon.port, "GET", "/health", undefined, { origin: "null" })).status, 403);
   });
+  await t.test("health counts every admission rejection by status", async () => {
+    assert.deepEqual((await getHealth(daemon.port)).localRejectionsByStatus, { 400: 3, 403: 3, 415: 2 });
+  });
+  await t.test("a burst logs one rejection per status", async () => {
+    const logged = await waitFor(async () => {
+      const lines = (await readDaemonLog(daemon.home)).match(/local request rejected \(\d+\):/g) ?? [];
+      return lines.length >= 3 && lines.sort();
+    }, "daemon did not log a rejection for each status", 1_000);
+    assert.deepEqual(logged, [400, 403, 415].map((status) => `local request rejected (${status}):`));
+  });
 });
 
 test("local token enforcement stages old clients, admits updated clients, and rolls back live", async (t) => {
@@ -169,17 +180,33 @@ test("local token enforcement stages old clients, admits updated clients, and ro
   const agent = path.join(daemon.home, "agent");
   const dir = path.join(agent, "codex-permit-gate");
   const switchFile = path.join(dir, "require-local-token.on");
+  const tokenFile = path.join(dir, "local-token");
+  const token = await fs.readFile(tokenFile, "utf8");
+  const auth = { authorization: `Bearer ${token}` };
+  const wrongAuth = { authorization: `Bearer ${token[0] === "0" ? "1" : "0"}${token.slice(1)}` };
+  const initial = await getHealth(daemon.port);
   const old = await acquire(daemon.port, "old-client");
   assert.equal(old.status, 200);
+  const renewal = { permitId: old.body.permitId };
+  assert.equal((await request(daemon.port, "POST", "/renew", renewal, auth)).body.ok, true);
+  assert.equal((await request(daemon.port, "POST", "/renew", renewal, wrongAuth)).body.ok, true);
   assert.equal((await release(daemon.port, old.body.permitId)).body.ok, true);
-  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const staged = await getHealth(daemon.port);
+  await t.test("health counts missing and wrong tokens with enforcement off", () => {
+    assert.deepEqual([initial.localControlPostsWithoutValidToken, staged.localControlPostsWithoutValidToken], [0, 3]);
+    assert.deepEqual(staged.localRejectionsByStatus, {});
+  });
   await fs.writeFile(switchFile, "", { mode: 0o600 });
   const denied = await acquire(daemon.port, "old-client");
   assert.equal(denied.status, 401);
-  assert.equal((await request(daemon.port, "POST", "/acquire", { session: "wrong-token" }, { authorization: `Bearer ${"0".repeat(64)}` })).status, 401);
+  assert.equal((await request(daemon.port, "POST", "/acquire", { session: "wrong-token" }, wrongAuth)).status, 401);
   const state = await getHealth(daemon.port);
   assert.deepEqual([state.ok, state.active, state.queued, state.granted], [true, 0, 0, 1]);
-  assert.equal((await fs.stat(path.join(dir, "local-token"))).mode & 0o777, 0o600);
+  await t.test("health counts rejections and invalid tokens with enforcement on", () => {
+    assert.deepEqual(state.localRejectionsByStatus, { 401: 2 });
+    assert.equal(state.localControlPostsWithoutValidToken, 5);
+  });
+  assert.equal((await fs.stat(tokenFile)).mode & 0o777, 0o600);
 
   const previous = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agent;
@@ -199,6 +226,16 @@ test("local token enforcement stages old clients, admits updated clients, and ro
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
+});
+
+test("a local token creation failure reaches the daemon log", async (t) => {
+  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), "permit-token-failure-"));
+  t.after(() => fs.rm(scratch, { recursive: true, force: true }));
+  const agentFile = path.join(scratch, "not-a-directory");
+  await fs.writeFile(agentFile, "fixture");
+  const daemon = await startDaemon({ PI_CODING_AGENT_DIR: agentFile });
+  t.after(() => daemon.stop());
+  await waitFor(async () => (await readDaemonLog(daemon.home)).includes("Could not create the local permit token"), "token creation failure did not reach the daemon log", 1_000);
 });
 
 test("shipped defaults keep several requests in flight and never serialize", async (t) => {

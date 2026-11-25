@@ -264,7 +264,7 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
   const ensure = options.ensure ?? ((daemonDir) => ensureDaemon(daemonDir, port));
   const release = options.release ?? ((releasePort, permitId) => postJson(releasePort, "/release", { permitId }, 5000));
   const wait = options.wait ?? waitForRetry;
-  let warned = false;
+  let warning: "unavailable" | "refused" | undefined;
 
   // Pi's before_provider_request runner logs and swallows handler exceptions.
   // Therefore failure must remain pending, not throw: returning control without
@@ -284,9 +284,13 @@ export async function acquirePermitResponse(body: any, dir: string, options: Acq
       return res;
     }
 
+    if (!isAborted(signal) && warning !== "refused" && typeof res?.error === "string" && res.error) {
+      warning = "refused";
+      try { options.onUnavailable?.(`Codex permit gate on port ${port} refused acquisition: ${res.error}. Provider request remains blocked.`); } catch {}
+    }
     try { await ensure(dir); } catch {}
-    if (!warned && attempt >= warningAfterAttempts) {
-      warned = true;
+    if (!warning && attempt >= warningAfterAttempts) {
+      warning = "unavailable";
       try {
         options.onUnavailable?.(`Codex permit gate unavailable after ${attempt} attempts; provider request remains blocked`);
       } catch {}

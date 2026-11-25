@@ -50,8 +50,8 @@ const INCREASE_AFTER_MS = Math.max(10000, parseInt(process.env.CODEX_PERMIT_GATE
 const PERMIT_TTL_MS = Math.max(0, parseInt(process.env.CODEX_PERMIT_GATE_PERMIT_TTL_MS || "300000", 10));
 const DIR = path.join(os.homedir(), ".pi", "agent", "codex-permit-gate");
 const LOG = path.join(DIR, "permit-daemon.log");
-const rejectLocalRequest = localRequestGuard();
-try { fs.mkdirSync(DIR, { recursive: true }); } catch {}
+try { fs.mkdirSync(DIR, { recursive: true, mode: 0o700 }); } catch {}
+const { rejectLocalRequest, stats: localAuthStats } = localRequestGuard(log);
 
 const stats = {
   startedAt: new Date().toISOString(),
@@ -256,7 +256,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     sweepStalePermits();
     const s = snapshot();
-    json(res, 200, { ok: true, version: 3, active: active.size, min: MIN, absoluteMin: ABSOLUTE_MIN, current, max: MAX, incident: incidentActive(), recentThrottles: throttleTimes.length, cooldownMsRemaining: Math.max(0, cooldownUntil - Date.now()), ...s, ...stats });
+    json(res, 200, { ok: true, version: 3, active: active.size, min: MIN, absoluteMin: ABSOLUTE_MIN, current, max: MAX, incident: incidentActive(), recentThrottles: throttleTimes.length, cooldownMsRemaining: Math.max(0, cooldownUntil - Date.now()), ...s, ...stats, ...localAuthStats });
     return;
   }
   if (req.method === "POST" && req.url === "/acquire") {

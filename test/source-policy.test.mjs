@@ -237,6 +237,23 @@ test("permit acquisition can recover after reporting prolonged unavailability", 
   assert.equal(warnings, 1);
 });
 
+test("a local acquire refusal reports its reason once and still waits for a permit", async () => {
+  const notices = [];
+  const noticesWhileWaiting = [];
+  let attempts = 0;
+  const response = await acquirePermitResponse({}, "/unused", {
+    warningAfterAttempts: 2,
+    ensure: async () => {},
+    request: async () => ++attempts === 4 ? { permitId: "recovered" } : { ok: false, error: "Local permit token required" },
+    onUnavailable: (message) => notices.push(message),
+    wait: async () => { noticesWhileWaiting.push(notices.length); },
+  });
+  assert.equal(response.permitId, "recovered");
+  assert.match(notices[0] ?? "", /Local permit token required/);
+  assert.deepEqual(noticesWhileWaiting, [1, 1, 1]);
+  assert.equal(notices.length, 1);
+});
+
 test("aborting an acquire stops the in-flight request and retry loop", async () => {
   const controller = new AbortController();
   let requests = 0;

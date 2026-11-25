@@ -120,7 +120,11 @@ Local daemons share a mode-`0600` `local-token` file under `<agent dir>/codex-pe
 
 Leave `require-local-token.on` absent while replacing local daemons and reloading sessions. Confirm all local clients and daemons use the same agent directory and the token exists with mode `0600`.
 
+Before enabling enforcement, watch `localControlPostsWithoutValidToken` in `GET /health`. It starts at zero and counts missing or invalid tokens on control POSTs that pass the header checks. Exercise each client and confirm the counter does not increase.
+
 After the reloads, create an empty `require-local-token.on` beside `local-token` to require a token on control POSTs. Remove the switch file to restore old client access without removing the header checks. Neither action requires a restart.
+
+`localRejectionsByStatus` counts admission rejections by HTTP status. Both counters reset on daemon restart. The daemon logs the first rejection per status, then logs repeats at most once per minute per status.
 
 `GET /health` remains available without a token. An updated client reads the token before each control POST.
 
