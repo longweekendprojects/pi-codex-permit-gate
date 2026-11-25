@@ -175,10 +175,14 @@ test("local admission rejects unsafe headers even without the exact switch file"
 });
 
 test("local token enforcement stages old clients, admits updated clients, and rolls back live", async (t) => {
-  const daemon = await startDaemon();
+  const daemon = await startDaemon({ PI_CODING_AGENT_DIR: "~/agent" });
   t.after(() => daemon.stop());
   const agent = path.join(daemon.home, "agent");
   const dir = path.join(agent, "codex-permit-gate");
+  await t.test("the listening log names the resolved token directory", async () => {
+    const line = await waitFor(async () => (await readDaemonLog(daemon.home)).split("\n").find((entry) => entry.includes("permit daemon listening on")), "listening log did not appear", 1_000);
+    assert.ok(line.includes(`token directory ${JSON.stringify(dir)}`), "listening log omitted the configured token directory");
+  });
   const switchFile = path.join(dir, "require-local-token.on");
   const tokenFile = path.join(dir, "local-token");
   const token = await fs.readFile(tokenFile, "utf8");

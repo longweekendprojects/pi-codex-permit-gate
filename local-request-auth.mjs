@@ -8,7 +8,7 @@ export const LOCAL_HOST = "127.0.0.1";
 function localAuthDirectory() {
   const home = os.homedir();
   const agent = process.env.PI_CODING_AGENT_DIR?.replace(/^~(?=\/|$)/, () => home) || path.join(home, ".pi", "agent");
-  return path.join(agent, "codex-permit-gate");
+  return path.resolve(agent, "codex-permit-gate");
 }
 
 function readToken(file) {
@@ -95,5 +95,5 @@ export function localRequestGuard(log) {
     return reject(401, "Local permit token required");
   }
 
-  return { rejectLocalRequest, stats };
+  return { rejectLocalRequest, stats, directory };
 }

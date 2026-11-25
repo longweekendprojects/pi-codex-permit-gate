@@ -51,7 +51,7 @@ const PERMIT_TTL_MS = Math.max(0, parseInt(process.env.CODEX_PERMIT_GATE_PERMIT_
 const DIR = path.join(os.homedir(), ".pi", "agent", "codex-permit-gate");
 const LOG = path.join(DIR, "permit-daemon.log");
 try { fs.mkdirSync(DIR, { recursive: true, mode: 0o700 }); } catch {}
-const { rejectLocalRequest, stats: localAuthStats } = localRequestGuard(log);
+const { rejectLocalRequest, stats: localAuthStats, directory: tokenDirectory } = localRequestGuard(log);
 
 const stats = {
   startedAt: new Date().toISOString(),
@@ -295,7 +295,7 @@ server.on("error", (err) => {
   log("server error", err.message);
   process.exit(1);
 });
-server.listen(PORT, LOCAL_HOST, () => log(`permit daemon listening on ${LOCAL_HOST}:${PORT}; concurrency ${current}/${MAX}; cooldown<=${MAX_COOLDOWN_MS}ms; permitTtl ${PERMIT_TTL_MS}ms`));
+server.listen(PORT, LOCAL_HOST, () => log(`permit daemon listening on ${LOCAL_HOST}:${PORT}; concurrency ${current}/${MAX}; cooldown<=${MAX_COOLDOWN_MS}ms; permitTtl ${PERMIT_TTL_MS}ms; token directory ${JSON.stringify(tokenDirectory)}`));
 const sweepTimer = setInterval(sweepStalePermits, 30000);
 if (sweepTimer.unref) sweepTimer.unref();
 function gracefulExit() {

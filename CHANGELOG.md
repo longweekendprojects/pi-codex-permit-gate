@@ -8,3 +8,4 @@
 - Report why a local permit request was refused without interrupting its wait.
 - Count local admission rejections and control POSTs without a valid token in `/health`.
 - Write rate-limited rejection messages and token creation failures to the daemon log.
+- Show the resolved token directory when a local daemon starts listening.
